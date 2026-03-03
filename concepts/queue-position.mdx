@@ -1,0 +1,572 @@
+---
+title: Queue Position Modeling
+description: Order fill simulation based on queue position estimation
+---
+
+## Overview
+
+Queue position is arguably the most critical component of high-frequency backtesting. When you place a limit order, you join a queue of orders at that price level. Your fill depends on where you are in that queue and how much trading activity occurs at that price.
+
+HftBacktest provides sophisticated queue models to estimate your position and determine when orders fill.
+
+## Why Queue Position Matters
+
+Consider a simple scenario:
+
+```
+Bid Side at $100:
+- Order 1: 10 contracts (at front of queue)
+- Order 2: 15 contracts
+- YOUR ORDER: 5 contracts  ← You're here
+- Order 3: 20 contracts
+- Order 4: 30 contracts
+Total: 80 contracts
+```
+
+If 30 contracts trade at $100:
+- Order 1 fills completely (10 filled, 20 remaining)
+- Order 2 fills completely (15 filled, 5 remaining)  
+- YOUR ORDER fills completely (5 filled, 0 remaining)
+- Order 3 doesn't fill
+
+You're **25 contracts from the front**. You fill when at least 25 contracts trade at your price.
+
+<Warning>
+  Without queue modeling, backtests optimistically assume instant fills when your price is reached. This drastically overstates HFT profitability.
+</Warning>
+
+## The QueueModel Trait
+
+Queue behavior is defined by the `QueueModel` trait from `backtest/models/queue.rs:24-40`:
+
+```rust
+pub trait QueueModel<MD>
+where
+    MD: MarketDepth,
+{
+    /// Initialize queue position when order is accepted
+    fn new_order(&self, order: &mut Order, depth: &MD);
+    
+    /// Adjust position when trades occur at this price
+    fn trade(&self, order: &mut Order, qty: f64, depth: &MD);
+    
+    /// Adjust position when depth changes at this price
+    fn depth(&self, order: &mut Order, prev_qty: f64, new_qty: f64, depth: &MD);
+    
+    /// Check if order should fill and return fill quantity
+    fn is_filled(&self, order: &mut Order, depth: &MD) -> f64;
+}
+```
+
+Queue state is stored in `order.q`, a boxed trait object allowing flexible state representation.
+
+## Queue Models
+
+### RiskAdverseQueueModel
+
+The most conservative model - you only advance when trades occur:
+
+```rust
+pub struct RiskAdverseQueueModel<MD>(PhantomData<MD>);
+```
+
+From `queue.rs:42-96`:
+
+```rust
+fn new_order(&self, order: &mut Order, depth: &MD) {
+    // Assume you're at the back of the queue
+    let front_q_qty = if order.side == Side::Buy {
+        depth.bid_qty_at_tick(order.price_tick)
+    } else {
+        depth.ask_qty_at_tick(order.price_tick)
+    };
+    order.q = Box::new(front_q_qty);
+}
+
+fn trade(&self, order: &mut Order, qty: f64, _depth: &MD) {
+    let front_q_qty = order.q.as_any_mut().downcast_mut::<f64>().unwrap();
+    *front_q_qty -= qty;  // Move forward by trade quantity
+}
+```
+
+**Characteristics:**
+- ✅ Most conservative (underestimates fills)
+- ✅ Simple and fast
+- ❌ Ignores depth changes
+- ❌ May be too pessimistic
+
+**Use when:**
+- You want guaranteed conservative results
+- The asset has large tick sizes and deep queues
+- You're making first-pass estimates
+
+### ProbQueueModel
+
+Probabilistic model that accounts for both trades and depth changes:
+
+```rust
+pub struct ProbQueueModel<P, MD>
+where
+    P: Probability,
+{
+    prob: P,
+    _md_marker: PhantomData<MD>,
+}
+```
+
+From `queue.rs:98-217`, this model maintains two pieces of state:
+
+```rust
+pub struct QueuePos {
+    front_q_qty: f64,    // Estimated queue ahead of you
+    cum_trade_qty: f64,  // Cumulative trades since last depth change
+}
+```
+
+#### How It Works
+
+<Steps>
+  <Step title="Order Submission">
+    Assume you're at the back:
+    ```rust
+    fn new_order(&self, order: &mut Order, depth: &MD) {
+        q.front_q_qty = depth.bid_qty_at_tick(order.price_tick);
+        q.cum_trade_qty = 0.0;
+    }
+    ```
+  </Step>
+  
+  <Step title="Trade Occurs">
+    Advance proportionally:
+    ```rust
+    fn trade(&self, order: &mut Order, qty: f64, _depth: &MD) {
+        q.front_q_qty -= qty;
+        q.cum_trade_qty += qty;
+    }
+    ```
+  </Step>
+  
+  <Step title="Depth Changes">
+    Adjust based on probability model:
+    ```rust
+    fn depth(&self, order: &mut Order, prev_qty: f64, new_qty: f64, _depth: &MD) {
+        let chg = prev_qty - new_qty;
+        chg -= q.cum_trade_qty;  // Don't double-count trades
+        q.cum_trade_qty = 0.0;
+        
+        let front = q.front_q_qty;
+        let back = prev_qty - front;
+        let prob = self.prob.prob(front, back);
+        
+        let est_front = front - (1.0 - prob) * chg + (back - prob * chg).min(0.0);
+        q.front_q_qty = est_front.min(new_qty);
+    }
+    ```
+  </Step>
+  
+  <Step title="Check Fill">
+    Fill when queue ahead exhausted:
+    ```rust
+    fn is_filled(&self, order: &mut Order, depth: &MD) -> f64 {
+        let exec = (-q.front_q_qty / depth.lot_size()).round() as i64;
+        if exec > 0 {
+            q.front_q_qty = 0.0;
+            (exec as f64) * depth.lot_size()
+        } else {
+            0.0
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+#### The Probability Function
+
+The probability function estimates the likelihood that quantity decreases came from ahead of your order vs behind:
+
+```rust
+pub trait Probability {
+    fn prob(&self, front: f64, back: f64) -> f64;
+}
+```
+
+If `front = 30` (ahead of you) and `back = 50` (behind you), and depth decreases by 20:
+- High probability → decrease came from behind (you don't advance)
+- Low probability → decrease came from ahead (you advance)
+
+### Probability Functions
+
+HftBacktest provides several probability functions:
+
+<Tabs>
+  <Tab title="PowerProbQueueFunc">
+    Uses power function `f(x) = x^n`:
+    ```rust
+    pub struct PowerProbQueueFunc { n: f64 }
+    
+    fn prob(&self, front: f64, back: f64) -> f64 {
+        self.f(back) / (self.f(back) + self.f(front))
+    }
+    
+    fn f(&self, x: f64) -> f64 {
+        x.powf(self.n)
+    }
+    ```
+    
+    **Higher n** → More conservative (assumes decreases from back)
+    
+    Typical: `n = 1.0` to `3.0`
+  </Tab>
+  
+  <Tab title="PowerProbQueueFunc2">
+    Alternative power function:
+    ```rust
+    fn prob(&self, front: f64, back: f64) -> f64 {
+        self.f(back) / self.f(back + front)
+    }
+    ```
+    
+    Slightly different behavior for extreme queue positions.
+  </Tab>
+  
+  <Tab title="PowerProbQueueFunc3">
+    Position-ratio based:
+    ```rust
+    fn prob(&self, front: f64, back: f64) -> f64 {
+        1.0 - self.f(front / (front + back))
+    }
+    ```
+    
+    From `queue.rs:310-330`. Used in many examples.
+  </Tab>
+  
+  <Tab title="LogProbQueueFunc">
+    Logarithmic function `f(x) = ln(1 + x)`:
+    ```rust
+    fn prob(&self, front: f64, back: f64) -> f64 {
+        self.f(back) / (self.f(back) + self.f(front))
+    }
+    
+    fn f(&self, x: f64) -> f64 {
+        (1.0 + x).ln()
+    }
+    ```
+    
+    Less aggressive than power functions.
+  </Tab>
+</Tabs>
+
+### Choosing a Probability Function
+
+Calibrate against live trading data:
+
+<Steps>
+  <Step title="Collect Fill Data">
+    Log all limit orders in live trading:
+    - Submission time
+    - Price and quantity
+    - Queue position estimate
+    - Whether filled and when
+    - Trades and depth changes while resting
+  </Step>
+  
+  <Step title="Backtest with Different Functions">
+    ```python
+    models = [
+        ('power_1', ProbQueueModel(PowerProbQueueFunc3(1.0))),
+        ('power_2', ProbQueueModel(PowerProbQueueFunc3(2.0))),
+        ('power_3', ProbQueueModel(PowerProbQueueFunc3(3.0))),
+        ('log', ProbQueueModel(LogProbQueueFunc())),
+    ]
+    
+    for name, model in models:
+        asset = BacktestAsset().queue_model(model)
+        # ... backtest and compare fills
+    ```
+  </Step>
+  
+  <Step title="Compare Fill Rates">
+    Measure:
+    - Fill rate (% of orders filled)
+    - Fill time (average time to fill)
+    - False fills (filled in backtest but not in live)
+    - Missed fills (not filled in backtest but filled in live)
+  </Step>
+  
+  <Step title="Select Best Model">
+    Choose the model with closest match to live trading.
+  </Step>
+</Steps>
+
+### Usage Examples
+
+<CodeGroup>
+```python Power Function (Python)
+from hftbacktest import BacktestAsset
+
+asset = (
+    BacktestAsset()
+        .data(['data.npz'])
+        .power_prob_queue_model(3.0)  # n=3
+        # ... other config
+)
+```
+
+```rust Power Function (Rust)
+use hftbacktest::backtest::models::{ProbQueueModel, PowerProbQueueFunc3};
+
+let asset = Asset::l2_builder()
+    .data(vec![DataSource::File("data.npz".to_string())])
+    .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+    // ... other config
+    .build()?;
+```
+
+```python Risk Averse (Python)
+asset = (
+    BacktestAsset()
+        .data(['data.npz'])
+        .risk_adverse_queue_model()  # Most conservative
+        # ... other config  
+)
+```
+</CodeGroup>
+
+## Level-3 Queue Model
+
+For Level-3 (Market-By-Order) data, use the FIFO queue model:
+
+```rust
+pub struct L3FIFOQueueModel {
+    pub backtest_orders: HashMap<OrderId, (Side, i64)>,
+    pub mkt_feed_orders: HashMap<OrderId, (Side, i64)>,
+    pub bid_queue: HashMap<i64, VecDeque<Order>>,
+    pub ask_queue: HashMap<i64, VecDeque<Order>>,
+}
+```
+
+From `queue.rs:473-1128`, this maintains explicit queues:
+
+<Tabs>
+  <Tab title="Order Addition">
+    Add your order to the queue:
+    ```rust
+    fn add_backtest_order(&mut self, mut order: Order, _depth: &MD) {
+        order.q = Box::new(L3OrderSource::Backtest);
+        let queue = self.bid_queue.entry(order.price_tick).or_default();
+        queue.push_back(order);  // Add to back of queue
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Market Order Arrival">
+    Track market orders from the feed:
+    ```rust
+    fn add_market_feed_order(&mut self, order: &Event, depth: &MD) {
+        let queue = self.bid_queue.entry(price_tick).or_default();
+        queue.push_back(Order { /* from event */ });
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Order Fill">
+    When a market order fills, check your position:
+    ```rust
+    fn fill_market_feed_order<const DELETE: bool>(
+        &mut self,
+        order_id: OrderId,
+        order: &Event,
+        depth: &MD,
+    ) -> Result<Vec<Order>, BacktestError> {
+        let queue = self.bid_queue.get_mut(&order_price_tick).unwrap();
+        let mut filled = Vec::new();
+        
+        // Fill all orders ahead of the market order
+        for order_in_q in queue {
+            if order_in_q.order_id == order_id {
+                break;  // Reached the market order
+            }
+            if order_in_q.is_backtest_order() {
+                filled.push(order_in_q.clone());
+            }
+        }
+        
+        filled
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Level-3 Accuracy
+
+<Check>
+  **Level-3 queue modeling is the most accurate** because:
+  - Exact FIFO position known
+  - No probabilistic estimation needed
+  - Matches exchange matching engine precisely
+  - Captures all order book dynamics
+</Check>
+
+However:
+- Requires L3 data (much larger files)
+- More computationally expensive
+- Not available for all exchanges/instruments
+
+## Queue Position in Practice
+
+### Checking Fill Probability
+
+Estimate your fill probability based on queue position:
+
+```python
+@njit
+def estimate_fill_probability(hbt, asset_no, price, side):
+    depth = hbt.depth(asset_no)
+    tick_size = depth.tick_size
+    price_tick = int(price / tick_size)
+    
+    # Get queue depth at this price
+    if side == BUY:
+        queue_qty = depth.bid_qty_at_tick(price_tick)
+    else:
+        queue_qty = depth.ask_qty_at_tick(price_tick)
+    
+    # Estimate: if you're at back, you need all queue_qty to trade
+    # Historical trade rate at this price
+    # (requires collecting statistics)
+    trade_rate = estimate_trade_rate(price_tick)  # contracts per second
+    
+    expected_fill_time = queue_qty / trade_rate
+    return expected_fill_time
+```
+
+### Adverse Selection
+
+Queue position affects adverse selection:
+
+```python
+@njit  
+def manage_adverse_selection(hbt):
+    """Cancel orders likely to suffer adverse selection"""
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    orders = hbt.orders(asset_no)
+    
+    order_values = orders.values()
+    while order_values.has_next():
+        order = order_values.get()
+        
+        if order.side == BUY:
+            # If best bid has moved away, we're likely at the front
+            # and will get adversely filled
+            if order.price_tick < depth.best_bid_tick:
+                hbt.cancel(asset_no, order.order_id, False)
+```
+
+### Queue-Aware Quoting
+
+Adjust quotes based on queue position:
+
+```python
+@njit
+def queue_aware_quoting(hbt):
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    
+    best_bid = depth.best_bid
+    best_bid_qty = depth.best_bid_qty
+    
+    # If queue is thin, join it
+    # If queue is thick, improve price (pay for priority)
+    THIN_THRESHOLD = 100.0  # contracts
+    
+    if best_bid_qty < THIN_THRESHOLD:
+        # Join the queue
+        quote_price = best_bid
+    else:
+        # Improve price by one tick to get front position
+        quote_price = best_bid + depth.tick_size
+    
+    hbt.submit_buy_order(asset_no, order_id, quote_price, qty, GTX, LIMIT, False)
+```
+
+See [Queue-Based Market Making](https://hftbacktest.readthedocs.io/en/latest/tutorials/Queue-Based%20Market%20Making%20in%20Large%20Tick%20Size%20Assets.html) tutorial.
+
+## Calibration and Validation
+
+### Fill Rate Analysis
+
+Compare backtested fills to live trading:
+
+```python
+import pandas as pd
+import numpy as np
+
+# Load live trading fills
+live_fills = pd.read_csv('live_fills.csv')
+live_fill_rate = len(live_fills) / total_live_orders
+
+# Load backtest fills
+backtest_fills = pd.read_csv('backtest_fills.csv')
+backtest_fill_rate = len(backtest_fills) / total_backtest_orders
+
+print(f"Live fill rate: {live_fill_rate:.2%}")
+print(f"Backtest fill rate: {backtest_fill_rate:.2%}")
+print(f"Difference: {(backtest_fill_rate - live_fill_rate):.2%}")
+
+# Goal: <5% difference
+if abs(backtest_fill_rate - live_fill_rate) < 0.05:
+    print("✓ Queue model is well calibrated")
+else:
+    print("✗ Queue model needs adjustment")
+```
+
+### Sensitivity Analysis
+
+Test different probability function parameters:
+
+```python
+import matplotlib.pyplot as plt
+
+n_values = np.linspace(1.0, 5.0, 20)
+fill_rates = []
+sharpe_ratios = []
+
+for n in n_values:
+    asset = BacktestAsset().power_prob_queue_model(n)
+    hbt = HashMapMarketDepthBacktest([asset])
+    strategy(hbt)
+    
+    state = hbt.state_values(0)
+    fill_rates.append(state.num_fills / state.num_orders)
+    sharpe_ratios.append(calculate_sharpe(hbt))
+
+plt.subplot(1, 2, 1)
+plt.plot(n_values, fill_rates)
+plt.xlabel('n (power function)')
+plt.ylabel('Fill Rate')
+
+plt.subplot(1, 2, 2)
+plt.plot(n_values, sharpe_ratios)
+plt.xlabel('n (power function)')
+plt.ylabel('Sharpe Ratio')
+
+plt.show()
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Order Book" icon="book" href="/concepts/order-book">
+    Queue position depends on order book depth
+  </Card>
+  <Card title="Latency" icon="network-wired" href="/concepts/latency">
+    Order arrival time affects queue position
+  </Card>
+  <Card title="Backtesting" icon="clock" href="/concepts/backtesting">
+    Queue models integrate into event processing
+  </Card>
+  <Card title="Queue Tutorial" icon="graduation-cap" href="https://hftbacktest.readthedocs.io/en/latest/tutorials/Queue-Based%20Market%20Making%20in%20Large%20Tick%20Size%20Assets.html">
+    Detailed queue-based strategy guide
+  </Card>
+</CardGroup>

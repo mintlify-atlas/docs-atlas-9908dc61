@@ -1,0 +1,152 @@
+---
+title: Rust API Overview
+description: Overview of the HftBacktest Rust API
+---
+
+HftBacktest is a Rust framework designed for developing and running high-frequency trading and market-making strategies. It focuses on accounting for both feed and order latencies, as well as the order queue position for order fill simulation.
+
+## Key Features
+
+- Complete tick-by-tick simulation with a variable time interval
+- Full order book reconstruction based on Level-2 feeds (Market-By-Price) and Level-3 feeds (Market-By-Order)
+- Backtest accounting for both feed and order latency, using provided models or custom models
+- Order fill simulation that takes into account the order queue position
+- Backtesting of multi-asset and multi-exchange models
+- Deployment of a live trading bot using the same algo code
+
+## Feature Flags
+
+The `default` feature enables both `backtest` and `live` features.
+
+- `backtest`: Enables backtesting features
+- `live`: Enables live trading bot functionality
+- `s3`: Enables accessing data files from S3
+
+## Module Structure
+
+The HftBacktest API is organized into several key modules:
+
+### Core Modules
+
+- **[types](/api/rust/types)** - Core type definitions including `Order`, `Event`, `Side`, `Status`, `TimeInForce`, and `OrdType`
+- **[backtest](/api/rust/backtest)** - Backtesting functionality including `Backtest`, `Asset`, and builders
+- **[depth](/api/rust/depth)** - Market depth implementations for order book management
+- **[live](/api/rust/live)** - Live trading bot functionality
+
+### Common Patterns
+
+The framework uses a builder pattern for constructing backtesting and live trading instances:
+
+```rust
+use hftbacktest::{
+    backtest::{
+        Asset,
+        Backtest,
+        DataSource,
+        ExchangeKind,
+        assettype::LinearAsset,
+        models::{
+            CommonFees,
+            ConstantLatency,
+            PowerProbQueueFunc3,
+            ProbQueueModel,
+            TradingValueFeeModel,
+        },
+    },
+    depth::HashMapMarketDepth,
+};
+
+let mut hbt = Backtest::builder()
+    .add_asset(
+        Asset::l2_builder()
+            .data(vec![DataSource::File("data.npz".to_string())])
+            .latency_model(ConstantLatency::new(50_000, 50_000))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(
+                CommonFees::new(-0.00005, 0.0007)
+            ))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::NoPartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(0.01, 1.0))
+            .build()?
+    )
+    .build()?;
+```
+
+## Bot Trait
+
+Both backtesting and live trading implement the `Bot` trait, providing a unified interface:
+
+```rust
+pub trait Bot<MD>
+where
+    MD: MarketDepth,
+{
+    type Error;
+
+    fn current_timestamp(&self) -> i64;
+    fn num_assets(&self) -> usize;
+    fn position(&self, asset_no: usize) -> f64;
+    fn state_values(&self, asset_no: usize) -> &StateValues;
+    fn depth(&self, asset_no: usize) -> &MD;
+    fn last_trades(&self, asset_no: usize) -> &[Event];
+    fn orders(&self, asset_no: usize) -> &HashMap<OrderId, Order>;
+    
+    fn submit_buy_order(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        order_type: OrdType,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn submit_sell_order(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        order_type: OrdType,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn cancel(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn elapse(&mut self, duration: i64) -> Result<ElapseResult, Self::Error>;
+    // ... additional methods
+}
+```
+
+## Getting Started
+
+1. Add HftBacktest to your `Cargo.toml`:
+
+```toml
+[dependencies]
+hftbacktest = "*"
+```
+
+2. Import the prelude for common types:
+
+```rust
+use hftbacktest::prelude::*;
+```
+
+3. Build your backtest or live bot using the builder pattern
+4. Implement your trading strategy using the `Bot` trait methods
+
+## Next Steps
+
+- [Core Types](/api/rust/types) - Learn about fundamental types like `Order`, `Event`, and enums
+- [Backtest Module](/api/rust/backtest) - Set up backtesting with custom models
+- [Market Depth](/api/rust/depth) - Understand order book implementations
+- [Live Trading](/api/rust/live) - Deploy strategies in production

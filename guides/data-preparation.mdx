@@ -1,0 +1,160 @@
+---
+title: Data Preparation
+description: Learn how to prepare and convert market data for HftBacktest
+---
+
+To fully utilize HftBacktest, you need tick-by-tick full order book and trade feed data. While this data isn't freely available like daily bar data from platforms such as Yahoo Finance, you can collect it yourself for cryptocurrencies.
+
+## Data Format Requirements
+
+HftBacktest requires normalized data with the following structure:
+
+- `ev`: Event type (u64)
+- `exch_ts`: Exchange timestamp in nanoseconds (i64)
+- `local_ts`: Local receipt timestamp in nanoseconds (i64)
+- `px`: Price (f64)
+- `qty`: Quantity (f64)
+- `order_id`: Order ID (u64)
+- `ival`: Integer value field (i64)
+- `fval`: Float value field (f64)
+
+<Note>
+All timestamps in HftBacktest are in **nanoseconds**.
+</Note>
+
+## Collecting Binance Futures Data
+
+### Step 1: Collect Raw Feed Data
+
+You can collect Binance Futures feed data using the [Data Collector](https://github.com/nkaz001/hftbacktest/tree/master/collector).
+
+Raw feed data format:
+```
+1723161255030314667 {"stream":"btcusdt@depth@0ms","data":{"e":"depthUpdate",...}}
+1723161255088169167 {"stream":"btcusdt@bookTicker","data":{"e":"bookTicker",...}}
+1723161255088176367 {"stream":"btcusdt@trade","data":{"e":"trade",...}}
+```
+
+The first token is the local receipt timestamp in nanoseconds.
+
+### Step 2: Convert to Normalized Format
+
+Use the built-in conversion utilities to normalize the raw data:
+
+```python
+import numpy as np
+from hftbacktest.data.utils import binancefutures
+
+# Convert raw data to normalized format
+data = binancefutures.convert(
+    'usdm/btcusdt_20240808.gz',
+    combined_stream=True
+)
+```
+
+The conversion process:
+- Corrects timestamp latencies
+- Reorders events to fix any timestamp inconsistencies
+- Produces normalized data ready for backtesting
+
+<Steps>
+
+### Save Directly to File
+
+You can save the normalized data directly during conversion:
+
+```python
+_ = binancefutures.convert(
+    'usdm/btcusdt_20240808.gz',
+    output_filename='usdm/btcusdt_20240808.npz',
+    combined_stream=True
+)
+```
+
+### Inspect the Data
+
+View the normalized data structure:
+
+```python
+import polars as pl
+
+df = pl.DataFrame(data)
+print(df)
+```
+
+</Steps>
+
+## Creating Market Depth Snapshots
+
+Since cryptocurrency exchanges run 24/7, you need initial snapshots to reconstruct complete market depth.
+
+### Build End-of-Day Snapshot
+
+```python
+from hftbacktest.data.utils.snapshot import create_last_snapshot
+
+# Build EOD snapshot for 20240808 to use as initial state for 20240809
+data = create_last_snapshot(
+    ['usdm/btcusdt_20240808.npz'],
+    tick_size=0.1,
+    lot_size=0.001
+)
+```
+
+### Save the Snapshot
+
+```python
+np.savez_compressed('usdm/btcusdt_20240808_eod.npz', data=data)
+```
+
+<Note>
+Snapshot data shows bid levels first, then ask levels, with both sorted from best price to farthest price.
+</Note>
+
+## Using Snapshots in Backtests
+
+Load the snapshot as the initial market state:
+
+```python
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+
+asset = (
+    BacktestAsset()
+        .data(['usdm/btcusdt_20240809.npz'])
+        .initial_snapshot('usdm/btcusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+
+hbt = HashMapMarketDepthBacktest([asset])
+```
+
+## Public Data Sources
+
+You can find some prepared data hosted by supporters:
+- [Binance USDM Futures Data](https://reach.stratosphere.capital/data/usdm/)
+
+## Data Preparation Checklist
+
+<Steps>
+
+### Collect raw feed data
+Use the data collector or download from public sources
+
+### Convert to normalized format
+Run the conversion utility with proper parameters
+
+### Create snapshots
+Build end-of-day snapshots for continuous backtesting
+
+### Verify data quality
+Check for gaps, timestamp issues, and completeness
+
+</Steps>
+
+## Next Steps
+
+- Learn about [Working with Market Depth and Trades](/guides/market-depth-trades)
+- Explore [Integrating Custom Data](/guides/custom-data)
+- See the [complete tutorial](https://hftbacktest.readthedocs.io/en/latest/tutorials/Data%20Preparation.html)

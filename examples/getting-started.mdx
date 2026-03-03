@@ -1,0 +1,130 @@
+---
+title: Getting Started
+description: A simple first strategy example using HftBacktest
+---
+
+This example demonstrates the basic concepts of HftBacktest by creating a simple trading strategy. It covers printing the best bid and ask prices, working with market depth data, and submitting orders.
+
+## Printing the Best Bid and Best Ask
+
+First, let's start with a simple example that prints the best bid and best ask prices:
+
+```python
+from numba import njit
+import numpy as np
+
+@njit
+def print_bbo(hbt):
+    # Iterating until hftbacktest reaches the end of data.
+    # Elapses 60-sec every iteration.
+    # Time unit is the same as data's timestamp's unit.
+    # Timestamp of the sample data is in nanoseconds.
+    while hbt.elapse(60 * 1e9) == 0:        
+        # Gets the market depth for the first asset.
+        depth = hbt.depth(0)
+
+        # Prints the best bid and the best offer.
+        print(
+            'current_timestamp:', hbt.current_timestamp,
+            ', best_bid:', np.round(depth.best_bid, 1),
+            ', best_ask:', np.round(depth.best_ask, 1)
+        )
+    return True
+```
+
+## Setting Up the Backtest Environment
+
+Next, we need to configure the backtest environment with asset properties and market settings:
+
+```python
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+
+asset = (
+    BacktestAsset()
+        .data(['usdm/btcusdt_20240809.npz'])
+        .initial_snapshot('usdm/btcusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .constant_latency(10_000_000, 10_000_000)
+        .risk_adverse_queue_model()
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(0.0002, 0.0007)
+        .tick_size(0.1)
+        .lot_size(0.001)
+        .last_trades_capacity(0)
+)
+
+hbt = HashMapMarketDepthBacktest([asset])
+```
+
+<Note>
+You can see the best bid and best ask every 60 seconds. Since the price is a 32-bit float, there may be floating-point errors. In the example, for readability, the price is rounded based on the tick size.
+</Note>
+
+## Getting Market Depth
+
+You can access market depth data beyond just the best bid and ask:
+
+```python
+@njit
+def print_3depth(hbt):
+    while hbt.elapse(60 * 1e9) == 0:
+        print('current_timestamp:', hbt.current_timestamp)
+
+        depth = hbt.depth(0)
+
+        # Iterate through bid and ask levels
+        i = 0
+        for tick_price in range(depth.best_ask_tick, depth.best_ask_tick + 100):
+            qty = depth.ask_qty_at_tick(tick_price)
+            if qty > 0:
+                print('ask: ', qty, '@', np.round(tick_price * depth.tick_size, 1))
+                i += 1
+                if i == 3:
+                    break
+
+        i = 0
+        for tick_price in range(depth.best_bid_tick, max(depth.best_bid_tick - 100, 0), -1):
+            qty = depth.bid_qty_at_tick(tick_price)
+            if qty > 0:
+                print('bid: ', qty, '@', np.round(tick_price * depth.tick_size, 1))
+                i += 1
+                if i == 3:
+                    break
+    return True
+```
+
+## Submitting Orders
+
+Here's how to submit and track orders:
+
+```python
+from hftbacktest import LIMIT, GTC, NONE, NEW, FILLED, CANCELED, EXPIRED
+
+@njit
+def submit_order(hbt):
+    is_order_submitted = False
+    while hbt.elapse(30 * 1e9) == 0:
+        depth = hbt.depth(0)
+        
+        if not is_order_submitted:
+            # Submits a buy order at 300 ticks below the best bid
+            order_id = 1
+            order_price = depth.best_bid - 300 * depth.tick_size
+            order_qty = 1
+            time_in_force = GTC  # Good 'till cancel
+            order_type = LIMIT
+            hbt.submit_buy_order(0, order_id, order_price, order_qty, time_in_force, order_type, False)
+            is_order_submitted = True
+    return True
+```
+
+## Key Concepts
+
+- **Time Units**: The timestamp unit is in nanoseconds for the sample data
+- **Market Depth**: Access detailed order book information using the depth API
+- **Order Management**: Submit, track, and cancel orders programmatically
+- **Asset Configuration**: Set up realistic trading parameters including fees, latency, and queue models
+
+<Note>
+HftBacktest cannot be reused. After using the backtest, make sure to close it with `hbt.close()`. If you use the backtest after closing, it will crash.
+</Note>

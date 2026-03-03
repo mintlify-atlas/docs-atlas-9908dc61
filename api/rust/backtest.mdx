@@ -1,0 +1,391 @@
+---
+title: Backtest Module
+description: Backtesting functionality for HftBacktest
+---
+
+The `backtest` module provides comprehensive backtesting functionality with support for multi-asset and multi-exchange simulations.
+
+## Core Types
+
+### Backtest
+
+The main backtester struct that provides multi-asset and multi-exchange model backtesting.
+
+```rust
+pub struct Backtest<MD> {
+    // Internal fields
+}
+
+impl<MD> Backtest<MD>
+where
+    MD: MarketDepth,
+{
+    pub fn builder() -> BacktestBuilder<MD>
+    
+    pub fn new(
+        local: Vec<Box<dyn LocalProcessor<MD>>>,
+        exch: Vec<Box<dyn Processor>>,
+        reader: Vec<Reader<Event>>,
+    ) -> Self
+    
+    pub fn goto_end(&mut self) -> Result<ElapseResult, BacktestError>
+}
+```
+
+The `Backtest` struct implements the [`Bot`](/api/rust/types#bot-trait) trait, providing methods for order submission, market data access, and time management.
+
+### BacktestBuilder
+
+Builder for constructing `Backtest` instances.
+
+```rust
+pub struct BacktestBuilder<MD> {
+    // Internal fields
+}
+
+impl<MD> BacktestBuilder<MD> {
+    pub fn add_asset(
+        self,
+        asset: Asset<dyn LocalProcessor<MD>, dyn Processor, Event>
+    ) -> Self
+    
+    pub fn build(self) -> Result<Backtest<MD>, BuildError>
+}
+```
+
+**Example:**
+
+```rust
+use hftbacktest::backtest::{
+    Asset,
+    Backtest,
+    DataSource,
+    ExchangeKind,
+    assettype::LinearAsset,
+    models::*,
+};
+use hftbacktest::depth::HashMapMarketDepth;
+
+let mut hbt = Backtest::builder()
+    .add_asset(
+        Asset::l2_builder()
+            .data(vec![DataSource::File("data.npz".to_string())])
+            .latency_model(ConstantLatency::new(50_000, 50_000))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::NoPartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(0.01, 1.0))
+            .build()?
+    )
+    .build()?;
+```
+
+## Asset Configuration
+
+### Asset
+
+Represents a backtesting asset with local and exchange processors.
+
+```rust
+pub struct Asset<L: ?Sized, E: ?Sized, D: NpyDTyped + Clone> {
+    pub local: Box<L>,
+    pub exch: Box<E>,
+    pub reader: Reader<D>,
+}
+
+impl<L, E, D: NpyDTyped + Clone> Asset<L, E, D> {
+    pub fn new(local: L, exch: E, reader: Reader<D>) -> Self
+    
+    pub fn l2_builder<LM, AT, QM, MD, FM>() -> L2AssetBuilder<LM, AT, QM, MD, FM>
+    where
+        AT: AssetType + Clone + 'static,
+        MD: MarketDepth + L2MarketDepth + 'static,
+        QM: QueueModel<MD> + 'static,
+        LM: LatencyModel + Clone + 'static,
+        FM: FeeModel + Clone + 'static
+    
+    pub fn l3_builder<LM, AT, QM, MD, FM>() -> L3AssetBuilder<LM, AT, QM, MD, FM>
+    where
+        AT: AssetType + Clone + 'static,
+        MD: MarketDepth + L3MarketDepth + 'static,
+        QM: L3QueueModel<MD> + 'static,
+        LM: LatencyModel + Clone + 'static,
+        FM: FeeModel + Clone + 'static,
+        BacktestError: From<<MD as L3MarketDepth>::Error>
+}
+```
+
+### L2AssetBuilder
+
+Builder for Level-2 (Market-By-Price) assets.
+
+```rust
+pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
+    // Internal fields
+}
+
+impl<LM, AT, QM, MD, FM> L2AssetBuilder<LM, AT, QM, MD, FM>
+where
+    AT: AssetType + Clone + 'static,
+    MD: MarketDepth + L2MarketDepth + 'static,
+    QM: QueueModel<MD> + 'static,
+    LM: LatencyModel + Clone + 'static,
+    FM: FeeModel + Clone + 'static,
+{
+    pub fn new() -> Self
+    
+    pub fn data(self, data: Vec<DataSource<Event>>) -> Self
+    
+    pub fn parallel_load(self, parallel_load: bool) -> Self
+    
+    pub fn latency_offset(self, latency_offset: i64) -> Self
+    
+    pub fn latency_model(self, latency_model: LM) -> Self
+    
+    pub fn asset_type(self, asset_type: AT) -> Self
+    
+    pub fn fee_model(self, fee_model: FM) -> Self
+    
+    pub fn exchange(self, exch_kind: ExchangeKind) -> Self
+    
+    pub fn last_trades_capacity(self, capacity: usize) -> Self
+    
+    pub fn queue_model(self, queue_model: QM) -> Self
+    
+    pub fn depth<Builder>(self, builder: Builder) -> Self
+    where
+        Builder: Fn() -> MD + 'static
+    
+    pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD>, dyn Processor, Event>, BuildError>
+}
+```
+
+### L3AssetBuilder
+
+Builder for Level-3 (Market-By-Order) assets.
+
+```rust
+pub struct L3AssetBuilder<LM, AT, QM, MD, FM> {
+    // Internal fields
+}
+```
+
+Provides the same methods as `L2AssetBuilder`, but configured for Level-3 order book data.
+
+## Exchange Models
+
+### ExchangeKind
+
+Specifies the exchange simulation model.
+
+```rust
+pub enum ExchangeKind {
+    /// Uses NoPartialFillExchange
+    NoPartialFillExchange,
+    /// Uses PartialFillExchange
+    PartialFillExchange,
+}
+```
+
+- **NoPartialFillExchange**: Orders are either completely filled or not filled at all
+- **PartialFillExchange**: Orders can be partially filled over multiple trades
+
+## Models
+
+The backtest module provides several model types for realistic simulation:
+
+### Latency Models
+
+Simulate order and feed latency:
+
+```rust
+pub trait LatencyModel {
+    fn entry(&mut self, timestamp: i64, order: &Order) -> i64;
+    fn response(&mut self, timestamp: i64, order: &Order) -> i64;
+}
+```
+
+**ConstantLatency**: Fixed latency for all orders
+
+```rust
+pub struct ConstantLatency {
+    // Internal fields
+}
+
+impl ConstantLatency {
+    pub fn new(entry_latency: i64, response_latency: i64) -> Self
+}
+```
+
+**IntpOrderLatency**: Interpolated latency from historical data
+
+```rust
+pub struct IntpOrderLatency {
+    // Internal fields
+}
+```
+
+### Queue Models
+
+Estimate order queue position and fill probability:
+
+```rust
+pub trait QueueModel<MD>
+where
+    MD: MarketDepth,
+{
+    fn new_order(&self, order: &mut Order, depth: &MD);
+    fn trade(&self, order: &mut Order, qty: f64, depth: &MD);
+    fn depth(&self, order: &mut Order, prev_qty: f64, new_qty: f64, depth: &MD);
+    fn is_filled(&self, order: &mut Order, depth: &MD) -> f64;
+}
+```
+
+**ProbQueueModel**: Probabilistic queue position model
+
+```rust
+pub struct ProbQueueModel<Prob, MD> {
+    // Internal fields
+}
+
+impl<Prob, MD> ProbQueueModel<Prob, MD> {
+    pub fn new(prob: Prob) -> Self
+}
+```
+
+**Probability Functions:**
+
+- `PowerProbQueueFunc`: Power function-based probability
+- `PowerProbQueueFunc2`: Alternative power function
+- `PowerProbQueueFunc3`: Third variant of power function
+- `LogProbQueueFunc`: Logarithmic probability function
+- `LogProbQueueFunc2`: Alternative logarithmic function
+
+**RiskAdverseQueueModel**: Conservative queue position model
+
+```rust
+pub struct RiskAdverseQueueModel<MD> {
+    // Internal fields
+}
+
+impl<MD> RiskAdverseQueueModel<MD> {
+    pub fn new() -> Self
+}
+```
+
+**L3FIFOQueueModel**: FIFO queue model for Level-3 data
+
+### Fee Models
+
+Calculate trading fees:
+
+```rust
+pub trait FeeModel {
+    fn amount(&self, order: &Order, amount: f64) -> f64;
+}
+```
+
+**CommonFees**: Standard maker/taker fees
+
+```rust
+pub struct CommonFees {
+    // Internal fields
+}
+
+impl CommonFees {
+    pub fn new(maker_fee: f64, taker_fee: f64) -> Self
+}
+```
+
+**TradingValueFeeModel**: Fees based on trade value
+
+```rust
+pub struct TradingValueFeeModel<Fees> {
+    // Internal fields
+}
+
+impl<Fees> TradingValueFeeModel<Fees> {
+    pub fn new(fees: Fees) -> Self
+}
+```
+
+**TradingQtyFeeModel**: Fees based on trade quantity
+
+**DirectionalFees**: Fees that differ by trade direction (buy/sell)
+
+```rust
+pub struct DirectionalFees {
+    // Internal fields
+}
+
+impl DirectionalFees {
+    pub fn new(common_fees: CommonFees, buyer_fee: f64, seller_fee: f64) -> Self
+}
+```
+
+## Data Sources
+
+```rust
+pub enum DataSource<D> {
+    File(String),
+    Data(Data<D>),
+}
+```
+
+Supports loading data from:
+- NPZ files (NumPy compressed format)
+- In-memory `Data` structures
+- S3 (with `s3` feature flag)
+
+## Errors
+
+```rust
+pub enum BacktestError {
+    OrderIdExist,
+    OrderRequestInProcess,
+    OrderNotFound,
+    InvalidOrderRequest,
+    InvalidOrderStatus,
+    EndOfData,
+    DataError(IoError),
+}
+```
+
+## Example: Multi-Asset Backtest
+
+```rust
+use hftbacktest::{
+    backtest::*,
+    depth::HashMapMarketDepth,
+    prelude::*,
+};
+
+let mut hbt = Backtest::builder()
+    .add_asset(
+        Asset::l2_builder()
+            .data(vec![DataSource::File("asset1.npz".to_string())])
+            .latency_model(ConstantLatency::new(50_000, 50_000))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(-0.00005, 0.0007)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::NoPartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(0.01, 1.0))
+            .build()?
+    )
+    .add_asset(
+        Asset::l2_builder()
+            .data(vec![DataSource::File("asset2.npz".to_string())])
+            .latency_model(ConstantLatency::new(100_000, 100_000))
+            .asset_type(LinearAsset::new(1.0))
+            .fee_model(TradingValueFeeModel::new(CommonFees::new(-0.00005, 0.0007)))
+            .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+            .exchange(ExchangeKind::NoPartialFillExchange)
+            .depth(|| HashMapMarketDepth::new(0.01, 1.0))
+            .build()?
+    )
+    .build()?;
+
+// Run your strategy
+hbt.elapse(10_000_000_000)?; // 10 seconds
+```

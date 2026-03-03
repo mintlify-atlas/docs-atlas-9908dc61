@@ -1,0 +1,424 @@
+---
+title: Order Book Reconstruction
+description: Level-2 and Level-3 order book reconstruction from market feed data
+---
+
+## Overview
+
+HftBacktest reconstructs the full order book state from historical market feed data. It supports both Level-2 (Market-By-Price) and Level-3 (Market-By-Order) feeds, maintaining the complete order book state tick-by-tick.
+
+## Market Depth Levels
+
+<Tabs>
+  <Tab title="Level-1">
+    Best bid and ask prices with quantities:
+    ```python
+    depth.best_bid      # Best bid price
+    depth.best_ask      # Best ask price
+    depth.best_bid_qty  # Quantity at best bid
+    depth.best_ask_qty  # Quantity at best ask
+    ```
+    
+    Sufficient for simple strategies but lacks depth information needed for queue modeling.
+  </Tab>
+  
+  <Tab title="Level-2 (MBP)">
+    Aggregated order book by price level:
+    ```python
+    # Full order book depth
+    depth.bid_qty_at_tick(price_tick)  # Total bid quantity at price
+    depth.ask_qty_at_tick(price_tick)  # Total ask quantity at price
+    ```
+    
+    Most common for HFT backtesting. Enables queue position estimation using probability models.
+  </Tab>
+  
+  <Tab title="Level-3 (MBO)">
+    Individual order information:
+    ```rust
+    pub struct L3Order {
+        pub order_id: OrderId,
+        pub side: Side,
+        pub price_tick: i64,
+        pub qty: f64,
+        pub timestamp: i64,
+    }
+    ```
+    
+    Highest fidelity. Enables exact FIFO queue position tracking.
+  </Tab>
+</Tabs>
+
+## Level-2 Market Depth
+
+### Depth Implementation
+
+HftBacktest provides multiple Level-2 implementations optimized for different use cases:
+
+<CardGroup cols={2}>
+  <Card title="HashMapMarketDepth" icon="hashtag">
+    Uses `HashMap` for O(1) price level access. Best for sparse order books.
+    ```python
+    from hftbacktest import HashMapMarketDepthBacktest
+    hbt = HashMapMarketDepthBacktest([asset])
+    ```
+  </Card>
+  
+  <Card title="BTreeMarketDepth" icon="tree">
+    Uses `BTreeMap` for ordered iteration. Better for dense order books.
+    ```rust
+    BTreeMarketDepth::new(tick_size, lot_size)
+    ```
+  </Card>
+  
+  <Card title="ROIVectorMarketDepth" icon="chart-line">
+    Array-based for order books within a fixed range of interest (ROI). Fastest for tight spreads.
+    ```rust
+    ROIVectorMarketDepth::new(tick_size, lot_size, roi_lb, roi_ub)
+    ```
+  </Card>
+  
+  <Card title="FusedHashMapMarketDepth" icon="layer-group">
+    Combines multiple feeds for cross-exchange backtesting.
+    ```rust
+    FusedHashMapMarketDepth::new(tick_size, lot_size)
+    ```
+  </Card>
+</CardGroup>
+
+### Depth Updates
+
+Level-2 order book updates are processed through the `L2MarketDepth` trait from `depth/mod.rs:64-94`:
+
+```rust
+pub trait L2MarketDepth {
+    fn update_bid_depth(
+        &mut self,
+        price: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> (i64, i64, i64, f64, f64, i64);
+    
+    fn update_ask_depth(
+        &mut self,
+        price: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> (i64, i64, i64, f64, f64, i64);
+}
+```
+
+Returns:
+- Price in ticks
+- Previous best price in ticks
+- New best price in ticks  
+- Previous quantity at the price
+- New quantity at the price
+- Timestamp
+
+### Usage Example
+
+```python
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+
+@njit
+def strategy(hbt):
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    
+    # Access best prices
+    best_bid = depth.best_bid
+    best_ask = depth.best_ask
+    spread = best_ask - best_bid
+    
+    # Check depth at specific prices
+    tick_size = depth.tick_size
+    bid_tick = int(best_bid / tick_size)
+    bid_qty = depth.bid_qty_at_tick(bid_tick)
+    
+    # Calculate mid-price
+    mid_price = (best_bid + best_ask) / 2.0
+```
+
+## Level-3 Market Depth
+
+### Order-by-Order Tracking
+
+Level-3 feeds provide individual order information, enabling exact queue position tracking. The `L3MarketDepth` trait from `depth/mod.rs:116-162` defines the interface:
+
+```rust
+pub trait L3MarketDepth: MarketDepth {
+    fn add_buy_order(
+        &mut self,
+        order_id: OrderId,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> Result<(i64, i64), Self::Error>;
+    
+    fn add_sell_order(
+        &mut self,
+        order_id: OrderId,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> Result<(i64, i64), Self::Error>;
+    
+    fn delete_order(
+        &mut self,
+        order_id: OrderId,
+        timestamp: i64,
+    ) -> Result<(Side, i64, i64), Self::Error>;
+    
+    fn modify_order(
+        &mut self,
+        order_id: OrderId,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> Result<(Side, i64, i64), Self::Error>;
+}
+```
+
+### L3 Backtesting
+
+To use Level-3 backtesting, configure the asset with L3 support:
+
+```rust
+let asset = Asset::l3_builder()
+    .data(vec![DataSource::File("l3_data.npz".to_string())])
+    .latency_model(latency_model)
+    .asset_type(asset_type)
+    .fee_model(fee_model)
+    .queue_model(L3FIFOQueueModel::new())  // FIFO queue for L3
+    .depth(|| HashMapMarketDepth::new(tick_size, lot_size))
+    .build()?;
+```
+
+<Note>
+  Level-3 data requires significantly more storage and processing power. A single day of L3 data for an active instrument can be several gigabytes.
+</Note>
+
+## Order Book Events
+
+The event types that drive order book reconstruction:
+
+<AccordionGroup>
+  <Accordion title="Depth Events (L2)">
+    Update aggregated quantity at a price level:
+    ```python
+    # Event flags from types.rs
+    DEPTH_EVENT        # Order book depth update
+    DEPTH_BUY_EVENT    # Bid side update
+    DEPTH_SELL_EVENT   # Ask side update
+    DEPTH_CLEAR_EVENT  # Clear order book (e.g., session end)
+    ```
+  </Accordion>
+  
+  <Accordion title="Trade Events">
+    Market trades that occurred:
+    ```python
+    TRADE_EVENT        # Trade executed
+    BUY_EVENT          # Buy-side trade (aggressor buy)
+    SELL_EVENT         # Sell-side trade (aggressor sell)
+    ```
+    
+    Trades affect queue position estimation.
+  </Accordion>
+  
+  <Accordion title="Order Events (L3)">
+    Individual order lifecycle:
+    ```python
+    ADD_ORDER_EVENT    # New order added to book
+    CANCEL_ORDER_EVENT # Order canceled
+    MODIFY_ORDER_EVENT # Order price/qty modified
+    FILL_EVENT         # Order filled
+    ```
+  </Accordion>
+  
+  <Accordion title="Snapshot Events">
+    Full order book state:
+    ```python
+    DEPTH_SNAPSHOT_EVENT  # Complete L2 snapshot
+    
+    # Apply snapshot
+    depth.apply_snapshot(snapshot_data)
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Snapshot Initialization
+
+Initialize the order book from a snapshot (e.g., end-of-day or start-of-day):
+
+```python
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20220901.npz'])
+        .initial_snapshot('data/btcusdt_20220831_eod.npz')  # Prior day EOD
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+```
+
+The snapshot provides the initial order book state before processing intraday events.
+
+## Multi-Exchange Depth
+
+For cross-exchange strategies, fuse multiple order books:
+
+```rust
+use hftbacktest::depth::FusedHashMapMarketDepth;
+
+let mut fused_depth = FusedHashMapMarketDepth::new(tick_size, lot_size);
+
+// Add exchange A data
+fused_depth.add_feed_depth(&depth_a);
+
+// Add exchange B data  
+fused_depth.add_feed_depth(&depth_b);
+
+// Combined best bid/ask across exchanges
+let best_bid = fused_depth.best_bid();
+let best_ask = fused_depth.best_ask();
+```
+
+See the [Multi-Asset](/concepts/multi-asset) guide for details.
+
+## Depth Access Patterns
+
+Common patterns for accessing order book data:
+
+<CodeGroup>
+```python Best Prices
+depth = hbt.depth(asset_no)
+
+# Price in float
+best_bid = depth.best_bid
+best_ask = depth.best_ask
+
+# Price in ticks (integer)
+best_bid_tick = depth.best_bid_tick
+best_ask_tick = depth.best_ask_tick
+
+# Quantities
+best_bid_qty = depth.best_bid_qty
+best_ask_qty = depth.best_ask_qty
+```
+
+```python Mid Price
+depth = hbt.depth(asset_no)
+mid_price = (depth.best_bid + depth.best_ask) / 2.0
+
+# Or weighted mid
+total_qty = depth.best_bid_qty + depth.best_ask_qty
+weighted_mid = (depth.best_bid * depth.best_ask_qty + 
+                depth.best_ask * depth.best_bid_qty) / total_qty
+```
+
+```python Spread Analysis
+depth = hbt.depth(asset_no)
+tick_size = depth.tick_size
+
+spread = depth.best_ask - depth.best_bid
+spread_bps = (spread / mid_price) * 10000
+spread_ticks = int(spread / tick_size)
+```
+
+```python Depth Profile
+depth = hbt.depth(asset_no)
+tick_size = depth.tick_size
+
+# Check liquidity at multiple levels
+best_bid_tick = depth.best_bid_tick
+for i in range(5):  # 5 levels
+    tick = best_bid_tick - i
+    qty = depth.bid_qty_at_tick(tick)
+    price = tick * tick_size
+    print(f"Bid {price}: {qty}")
+```
+</CodeGroup>
+
+## Performance Considerations
+
+<Tabs>
+  <Tab title="Memory">
+    Order book memory usage depends on implementation:
+    
+    - **HashMap**: O(N) where N = number of active price levels
+    - **BTree**: O(N) with better cache locality
+    - **ROIVector**: O(R) where R = range of interest size (fixed)
+    - **L3**: O(M) where M = number of individual orders
+    
+    For a typical crypto perpetual, L2 uses ~1-10 KB per instrument, L3 uses ~100KB-1MB.
+  </Tab>
+  
+  <Tab title="Update Speed">
+    Update operation complexity:
+    
+    - **HashMap**: O(1) average, O(N) worst case
+    - **BTree**: O(log N)
+    - **ROIVector**: O(1) if within range
+    - **L3**: O(M) for queue operations
+    
+    HashMapMarketDepth is typically fastest for sparse books.
+  </Tab>
+  
+  <Tab title="Data Loading">
+    Enable parallel data loading to reduce I/O overhead:
+    
+    ```rust
+    .parallel_load(true)  // Load next file while processing current
+    ```
+    
+    This overlaps data loading with backtesting computation.
+  </Tab>
+</Tabs>
+
+## Validation
+
+Ensure order book integrity:
+
+<Steps>
+  <Step title="Snapshot Consistency">
+    Verify initial snapshot loads correctly:
+    ```python
+    depth = hbt.depth(0)
+    assert depth.best_bid < depth.best_ask, "Crossed book!"
+    assert depth.best_bid_qty > 0, "Invalid bid quantity"
+    ```
+  </Step>
+  
+  <Step title="Spread Sanity">
+    Check for unrealistic spreads:
+    ```python
+    spread = depth.best_ask - depth.best_bid
+    tick_size = depth.tick_size
+    assert spread >= tick_size, "Crossed book"
+    assert spread < mid_price * 0.01, "Spread > 1%"
+    ```
+  </Step>
+  
+  <Step title="Event Ordering">
+    Ensure events are monotonically increasing:
+    ```python
+    # Check feed_latency to verify timestamp ordering
+    exch_ts, local_ts = hbt.feed_latency(asset_no)
+    assert local_ts >= exch_ts, "Negative latency!"
+    ```
+  </Step>
+</Steps>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Queue Position" icon="list-ol" href="/concepts/queue-position">
+    How order book depth affects fill simulation
+  </Card>
+  <Card title="Backtesting" icon="clock" href="/concepts/backtesting">
+    Event-driven backtesting architecture
+  </Card>
+  <Card title="Data Preparation" icon="database" href="/tutorials/data-preparation">
+    Converting raw feed data to HftBacktest format
+  </Card>
+</CardGroup>

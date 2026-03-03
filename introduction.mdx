@@ -1,0 +1,172 @@
+---
+title: Introduction
+description: High-frequency trading and market-making backtesting tool with accurate order fill simulation
+---
+
+# Welcome to HftBacktest
+
+HftBacktest is a high-frequency trading and market-making backtesting framework designed for developing HFT strategies with accurate simulation of market conditions.
+
+<CardGroup cols={2}>
+  <Card
+    title="Installation"
+    icon="download"
+    href="/installation"
+  >
+    Get started with Python or Rust installation
+  </Card>
+  <Card
+    title="Quick Start"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Run your first backtest in minutes
+  </Card>
+  <Card
+    title="Tutorials"
+    icon="book"
+    href="/tutorials"
+  >
+    Learn market-making strategies and techniques
+  </Card>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api-reference"
+  >
+    Explore the complete API documentation
+  </Card>
+</CardGroup>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Accurate Fill Simulation" icon="chart-line">
+    Simulates order fills accounting for queue position and latencies
+  </Card>
+  <Card title="Full Order Book Replay" icon="layer-group">
+    Complete tick-by-tick simulation with Level-2 and Level-3 support
+  </Card>
+  <Card title="Latency Modeling" icon="clock">
+    Accounts for both feed and order latency using custom models
+  </Card>
+  <Card title="Multi-Asset Support" icon="coins">
+    Backtest strategies across multiple assets and exchanges
+  </Card>
+  <Card title="High Performance" icon="bolt">
+    Python code runs in Numba JIT, Rust provides native performance
+  </Card>
+  <Card title="Live Trading" icon="satellite-dish">
+    Deploy the same code for live trading (Rust only)
+  </Card>
+</CardGroup>
+
+## Why Accurate Backtesting Matters
+
+Trading is a highly competitive field where only small edges usually exist, but they can still make a significant difference. Because of this, backtesting must accurately simulate real-world conditions.
+
+<Note>
+**Foundation First**: Accurate backtesting is the foundation. Without it, all further analysis—whether conservative or aggressive—becomes unreliable.
+</Note>
+
+This framework focuses on:
+- **Not overly pessimistic**: Avoids hiding small edges and profit opportunities
+- **Not overly optimistic**: Prevents unrealistic simulation that overstates performance
+- **Validation ready**: Backtests should closely align with live trading results for the same period
+
+<Tip>
+If you run a live trading strategy in January 2025, the backtest for that exact period should produce results that closely align with actual results. This validates your backtesting accuracy before proceeding to optimization.
+</Tip>
+
+## What You Can Build
+
+<CardGroup cols={3}>
+  <Card title="Market Making" icon="arrows-left-right">
+    Build sophisticated market-making strategies with spread management
+  </Card>
+  <Card title="Grid Trading" icon="grid">
+    Implement high-frequency grid trading with queue positioning
+  </Card>
+  <Card title="Arbitrage" icon="scale-balanced">
+    Develop cross-exchange arbitrage strategies
+  </Card>
+  <Card title="Statistical Arbitrage" icon="chart-scatter">
+    Create multi-asset statistical arbitrage strategies
+  </Card>
+  <Card title="Alpha Strategies" icon="brain">
+    Integrate alpha signals with market-making
+  </Card>
+  <Card title="Risk Management" icon="shield">
+    Test risk mitigation in extreme market conditions
+  </Card>
+</CardGroup>
+
+## Language Support
+
+HftBacktest is available in two implementations:
+
+<CodeGroup>
+```python Python
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+from numba import njit
+
+@njit
+def strategy(hbt):
+    # Your strategy logic here
+    pass
+```
+
+```rust Rust
+use hftbacktest::prelude::*;
+
+fn strategy<MD>(hbt: &mut Backtest<MD>) -> Result<(), HftBacktestError>
+where
+    MD: MarketDepth
+{
+    // Your strategy logic here
+    Ok(())
+}
+```
+</CodeGroup>
+
+### Python
+- **Version**: Python 3.11+
+- **Performance**: Runs in Numba JIT for near-native speed
+- **Use Case**: Rapid prototyping, research, and strategy development
+- **Ecosystem**: Integrates with NumPy, Polars, Matplotlib
+
+### Rust
+- **Version**: Rust 1.91.1+
+- **Performance**: Native compiled performance
+- **Use Case**: Production backtesting and live trading deployment
+- **Features**: Type safety, memory safety, concurrent execution
+
+## Getting Started
+
+Ready to start backtesting? Follow these steps:
+
+<Steps>
+  <Step title="Install HftBacktest">
+    Choose Python or Rust and install the package
+  </Step>
+  <Step title="Prepare Your Data">
+    Get market data in the required format (order book and trades)
+  </Step>
+  <Step title="Write Your Strategy">
+    Implement your trading logic using the framework API
+  </Step>
+  <Step title="Run Backtest">
+    Execute your backtest and analyze the results
+  </Step>
+  <Step title="Optimize & Deploy">
+    Refine your strategy and deploy to live trading (Rust)
+  </Step>
+</Steps>
+
+<Card
+  title="Next: Install HftBacktest"
+  icon="arrow-right"
+  href="/installation"
+>
+  Get HftBacktest installed on your system
+</Card>

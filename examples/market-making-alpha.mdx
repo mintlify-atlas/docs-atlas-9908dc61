@@ -1,0 +1,174 @@
+---
+title: Market Making with Alpha - Order Book Imbalance
+description: Using order book imbalance as an alpha signal for market making
+---
+
+<Note>
+This example is for educational purposes only and demonstrates effective strategies for high-frequency market-making schemes. All backtests are based on a 0.005% rebate, the highest market maker rebate available on Binance Futures. See [Binance Upgrades USDⓢ-Margined Futures Liquidity Provider Program](https://www.binance.com/en/support/announcement/binance-updates-usd%E2%93%A2-margined-futures-liquidity-provider-program-2024-06-03-fefc6aa25e0947e2bf745c1c56bea13e) for more details.
+</Note>
+
+## Overview
+
+Order Book Imbalance, also known as Order Flow Imbalance, is a widely recognized microstructure indicator often analyzed alongside trade flow. This concept has several derivatives, including:
+
+- **Micro-Price**
+- **VAMP (Volume Adjusted Mid Price)**
+- **Weighted-Depth Order Book Price**
+- **Static Order Book Imbalance**
+
+### Static Order Book Imbalance
+
+$$
+\text{Static Order Book Imbalance} = \frac{\sum_{i}^N Q_{bid}^i - \sum_{i}^N Q_{ask}^i}{\sum_{i}^N Q_{bid}^i + \sum_{i}^N Q_{ask}^i}
+$$
+
+Through standardization, an alternative expression for order imbalance can be obtained:
+
+$$
+\text{Standardized Order Book Imbalance} = \text{standardize}(\sum_{i}^N Q_{bid}^i - \sum_{i}^N Q_{ask}^i)
+$$
+
+### Volume Adjusted Mid Price (VAMP)
+
+Note that price and quantity are cross-multiplied between bid and ask sides:
+
+$$
+VAMP_{bbo} = \frac{P_{best\ bid} \times Q_{best\ ask} + P_{best\ ask} \times Q_{best\ bid}}{Q_{best\ bid} + Q_{best\ ask}}
+$$
+
+$$
+VAMP_N = \frac{\sum_{i}^N P_{bid}^i \times Q_{ask}^i + \sum_{i}^N P_{ask}^i \times Q_{bid}^i}{\sum_{i}^N Q_{bid}^i + \sum_{i}^N Q_{ask}^i}
+$$
+
+where N is usually defined as a percentage of the mid price. For 1% market depth, compute bid side down to mid × 0.99 and ask side up to mid × 1.01.
+
+### Weighted-Depth Order Book Price
+
+Note that price and quantity are multiplied within the same side:
+
+$$
+\text{Weighted-Depth Order Book Price} = \frac{\sum_{i}^N P_{bid}^i \times Q_{bid}^i + \sum_{i}^N P_{ask}^i \times Q_{ask}^i}{\sum_{i}^N Q_{bid}^i + \sum_{i}^N Q_{ask}^i}
+$$
+
+In this case, N is defined by a fixed total quantity. For 500 qty of market depth, compute bid side down to its total quantity reaches 500 and ask side up to its total quantity reaches 500.
+
+## Implementation
+
+```python
+import numpy as np
+from numba import njit
+from numba.typed import Dict
+from hftbacktest import BUY, SELL, GTX, LIMIT
+
+@njit
+def obi_mm(
+    hbt,
+    stat,
+    half_spread,
+    skew,
+    c1,
+    looking_depth,
+    interval,
+    window,
+    order_qty_dollar,
+    max_position_dollar,
+    grid_num,
+    grid_interval,
+    roi_lb,
+    roi_ub
+):
+    asset_no = 0
+    imbalance_timeseries = np.full(30_000_000, np.nan, np.float64)
+
+    tick_size = hbt.depth(0).tick_size
+    lot_size = hbt.depth(0).lot_size
+    
+    t = 0
+    roi_lb_tick = int(round(roi_lb / tick_size))
+    roi_ub_tick = int(round(roi_ub / tick_size))
+    
+    while hbt.elapse(interval) == 0:
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+        
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        # Calculate order book imbalance
+        sum_ask_qty = 0.0
+        from_tick = max(depth.best_ask_tick, roi_lb_tick)
+        upto_tick = min(int(np.floor(mid_price * (1 + looking_depth) / tick_size)), roi_ub_tick)
+        for price_tick in range(from_tick, upto_tick):
+            sum_ask_qty += depth.ask_depth[price_tick - roi_lb_tick]
+                
+        sum_bid_qty = 0.0
+        from_tick = min(depth.best_bid_tick, roi_ub_tick)
+        upto_tick = max(int(np.ceil(mid_price * (1 - looking_depth) / tick_size)), roi_lb_tick)
+        for price_tick in range(from_tick, upto_tick, -1):
+            sum_bid_qty += depth.bid_depth[price_tick - roi_lb_tick]
+
+        imbalance_timeseries[t] = sum_bid_qty - sum_ask_qty
+        
+        # Standardize the order book imbalance
+        m = np.nanmean(imbalance_timeseries[max(0, t + 1 - window):t + 1])
+        s = np.nanstd(imbalance_timeseries[max(0, t + 1 - window):t + 1])
+        alpha = np.divide(imbalance_timeseries[t] - m, s)
+    
+        # Compute bid and ask prices
+        order_qty = max(round((order_qty_dollar / mid_price) / lot_size) * lot_size, lot_size)
+        fair_price = mid_price + c1 * alpha
+        
+        normalized_position = position / order_qty
+        reservation_price = fair_price - skew * normalized_position
+
+        bid_price = min(np.round(reservation_price - half_spread), best_bid)
+        ask_price = max(np.round(reservation_price + half_spread), best_ask)
+        
+        bid_price = np.floor(bid_price / tick_size) * tick_size
+        ask_price = np.ceil(ask_price / tick_size) * tick_size
+        
+        # Update quotes (order management code)
+        # ...
+        
+        t += 1
+        stat.record(hbt)
+```
+
+## Key Parameters
+
+- **half_spread**: Base half spread in price units
+- **skew**: Position-based skew coefficient
+- **c1**: Alpha signal multiplier
+- **looking_depth**: Depth percentage from mid-price for imbalance calculation (e.g., 0.025 = 2.5%)
+- **interval**: Strategy update interval in nanoseconds
+- **window**: Rolling window size for standardization
+- **order_qty_dollar**: Dollar amount per order
+- **max_position_dollar**: Maximum position in dollar terms
+
+## References
+
+- [The Micro-Price: A High Frequency Estimator of Future Prices](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2970694)
+- [Mind the Gaps: Short-Term Crypto Price Prediction](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4351947)
+- [Market microstructure signals](https://blog.headlandstech.com/2017/08/)
+
+## Performance Considerations
+
+The order book imbalance signal works best when:
+- Market depth is sufficient and stable
+- The asset has reasonable liquidity
+- Parameters are properly calibrated for the specific asset
+- Rebates are available to offset trading costs
+
+Typical results show:
+- Sharpe Ratio: 10-15 (annualized)
+- Daily number of trades: 4,000-4,500
+- Return per trade: 0.008-0.014% (including rebates)
+
+<Note>
+The effectiveness of this strategy heavily depends on having access to maker rebates. Without rebates, the strategy may not be profitable after accounting for trading fees.
+</Note>

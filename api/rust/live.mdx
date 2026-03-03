@@ -1,0 +1,503 @@
+---
+title: Live Trading Module
+description: Live trading bot functionality for HftBacktest
+---
+
+The `live` module provides functionality for deploying trading strategies in live markets using the same code and interface as backtesting.
+
+## Core Types
+
+### LiveBot
+
+A live trading bot that implements the same [`Bot`](/api/rust/types#bot-trait) trait as the backtester.
+
+```rust
+pub struct LiveBot<CH, MD> {
+    // Internal fields
+}
+
+impl<CH, MD> LiveBot<CH, MD>
+where
+    CH: Channel,
+    MD: MarketDepth + L2MarketDepth,
+{
+    pub fn builder() -> LiveBotBuilder<MD>
+}
+```
+
+The `LiveBot` receives market data and order updates from connectors via an IPC channel and processes them in real-time.
+
+**Example:**
+
+```rust
+use hftbacktest::{
+    live::{Instrument, LiveBot},
+    depth::HashMapMarketDepth,
+};
+
+let tick_size = 0.01;
+let lot_size = 1.0;
+
+let mut bot = LiveBot::builder()
+    .register(Instrument::new(
+        "binance",        // connector name
+        "BTCUSDT",        // symbol
+        tick_size,
+        lot_size,
+        HashMapMarketDepth::new(tick_size, lot_size),
+        100               // last trades capacity
+    ))
+    .build()?;
+```
+
+### LiveBotBuilder
+
+Builder for constructing `LiveBot` instances.
+
+```rust
+pub struct LiveBotBuilder<MD> {
+    // Internal fields
+}
+
+impl<MD> LiveBotBuilder<MD> {
+    pub fn new() -> Self
+    
+    pub fn register(self, instrument: Instrument<MD>) -> Self
+    
+    pub fn error_handler<Handler>(self, handler: Handler) -> Self
+    where
+        Handler: Fn(LiveError) -> Result<(), BotError> + 'static
+    
+    pub fn order_recv_hook<Hook>(self, hook: Hook) -> Self
+    where
+        Hook: Fn(&Order, &Order) -> Result<(), BotError> + 'static
+    
+    pub fn id(self, id: u64) -> Self
+    
+    pub fn build<CH>(self) -> Result<LiveBot<CH, MD>, BuildError>
+    where
+        CH: Channel
+}
+```
+
+**Methods:**
+
+- `new()` - Creates a new builder with a random bot ID
+- `register(instrument)` - Adds an instrument for trading
+- `error_handler(handler)` - Sets callback for handling connector errors
+- `order_recv_hook(hook)` - Sets callback invoked when order updates are received
+- `id(id)` - Sets a custom bot ID (must be unique per connector)
+- `build()` - Constructs the `LiveBot` instance
+
+### Instrument
+
+Represents a trading instrument (asset) in the live bot.
+
+```rust
+pub struct Instrument<MD> {
+    // Internal fields
+}
+
+impl<MD> Instrument<MD> {
+    pub fn new(
+        connector_name: &str,
+        symbol: &str,
+        tick_size: f64,
+        lot_size: f64,
+        depth: MD,
+        last_trades_capacity: usize,
+    ) -> Self
+}
+```
+
+**Parameters:**
+
+- `connector_name` - Name of the connector to use for this instrument
+- `symbol` - Trading symbol (symbology depends on the connector)
+- `tick_size` - Minimum price increment
+- `lot_size` - Minimum quantity increment
+- `depth` - Market depth implementation
+- `last_trades_capacity` - Number of recent trades to store (0 to disable)
+
+## Errors and Events
+
+### BotError
+
+Errors that can occur during live trading.
+
+```rust
+pub enum BotError {
+    OrderIdExist,
+    InstrumentNotFound,
+    OrderNotFound,
+    InvalidOrderStatus,
+    Timeout,
+    Interrupted,
+    Custom(String),
+}
+```
+
+### LiveError
+
+Error information received from connectors.
+
+```rust
+pub struct LiveError {
+    pub kind: ErrorKind,
+    pub value: Value,
+}
+
+impl LiveError {
+    pub fn new(kind: ErrorKind) -> LiveError
+    
+    pub fn with(kind: ErrorKind, value: Value) -> LiveError
+    
+    pub fn value(&self) -> &Value
+}
+```
+
+### ErrorKind
+
+Type of error from the connector.
+
+```rust
+pub enum ErrorKind {
+    ConnectionInterrupted,
+    CriticalConnectionError,
+    OrderError,
+    Custom(i64),
+}
+```
+
+### LiveEvent
+
+Events sent by connectors to the bot.
+
+```rust
+pub enum LiveEvent {
+    BatchStart,
+    BatchEnd,
+    Feed {
+        symbol: String,
+        event: Event,
+    },
+    Order {
+        symbol: String,
+        order: Order,
+    },
+    Position {
+        symbol: String,
+        qty: f64,
+        exch_ts: i64,
+    },
+    Error(LiveError),
+}
+```
+
+**Event Types:**
+
+- `BatchStart` / `BatchEnd` - Marks the beginning and end of a batch of events
+- `Feed` - Market data feed event (depth, trades, etc.)
+- `Order` - Order update (new, filled, canceled, etc.)
+- `Position` - Position update from the exchange
+- `Error` - Error notification from the connector
+
+### LiveRequest
+
+Requests sent from the bot to connectors.
+
+```rust
+pub enum LiveRequest {
+    Order {
+        symbol: String,
+        order: Order,
+    },
+    RegisterInstrument {
+        symbol: String,
+        tick_size: f64,
+        lot_size: f64,
+    },
+}
+```
+
+## Value Type
+
+A variant type for passing data between bot and connector.
+
+```rust
+pub enum Value {
+    String(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    List(Vec<Value>),
+    Map(HashMap<String, Value>),
+    Empty,
+}
+
+impl Value {
+    pub fn get_str(&self) -> Option<&str>
+    pub fn get_int(&self) -> Option<i64>
+    pub fn get_float(&self) -> Option<f64>
+    pub fn get_bool(&self) -> Option<bool>
+    pub fn get_list(&self) -> Option<&Vec<Value>>
+    pub fn get_map(&self) -> Option<&HashMap<String, Value>>
+}
+```
+
+## IPC Communication
+
+The live bot communicates with connectors through an IPC channel.
+
+### Channel Trait
+
+```rust
+pub trait Channel {
+    type Error;
+    
+    fn build<MD>(instruments: &[Instrument<MD>]) -> Result<Self, BuildError>
+    where
+        Self: Sized;
+    
+    fn send(
+        &mut self,
+        bot_id: u64,
+        inst_no: usize,
+        request: LiveRequest,
+    ) -> Result<(), Self::Error>;
+    
+    fn recv_timeout(
+        &mut self,
+        bot_id: u64,
+        timeout: Duration,
+    ) -> Result<(usize, LiveEvent), BotError>;
+}
+```
+
+## Usage Examples
+
+### Basic Live Bot Setup
+
+```rust
+use hftbacktest::{
+    live::{Instrument, LiveBot},
+    depth::HashMapMarketDepth,
+    prelude::*,
+};
+
+let mut bot = LiveBot::builder()
+    .register(Instrument::new(
+        "binance",
+        "BTCUSDT",
+        0.01,
+        0.001,
+        HashMapMarketDepth::new(0.01, 0.001),
+        100
+    ))
+    .error_handler(|error| {
+        eprintln!("Error from connector: {:?}", error);
+        Ok(())
+    })
+    .order_recv_hook(|existing, update| {
+        println!("Order updated: {:?} -> {:?}", existing, update);
+        Ok(())
+    })
+    .build()?;
+
+// Use the same Bot trait as in backtesting
+let asset_no = 0;
+let depth = bot.depth(asset_no);
+let position = bot.position(asset_no);
+```
+
+### Multi-Instrument Bot
+
+```rust
+use hftbacktest::{
+    live::{Instrument, LiveBot},
+    depth::HashMapMarketDepth,
+};
+
+let mut bot = LiveBot::builder()
+    .register(Instrument::new(
+        "binance",
+        "BTCUSDT",
+        0.01,
+        0.001,
+        HashMapMarketDepth::new(0.01, 0.001),
+        100
+    ))
+    .register(Instrument::new(
+        "binance",
+        "ETHUSDT",
+        0.01,
+        0.001,
+        HashMapMarketDepth::new(0.01, 0.001),
+        100
+    ))
+    .build()?;
+
+// Asset 0: BTCUSDT
+// Asset 1: ETHUSDT
+let btc_depth = bot.depth(0);
+let eth_depth = bot.depth(1);
+```
+
+### Trading in Live Mode
+
+```rust
+use hftbacktest::prelude::*;
+
+// Submit orders using the same interface as backtesting
+let order_id = 1;
+bot.submit_buy_order(
+    0,                    // asset_no
+    order_id,
+    50000.0,              // price
+    0.01,                 // qty
+    TimeInForce::GTC,
+    OrdType::Limit,
+    true                  // wait for response
+)?;
+
+// Cancel order
+bot.cancel(0, order_id, true)?;
+
+// Access market data
+let depth = bot.depth(0);
+let best_bid = depth.best_bid();
+let best_ask = depth.best_ask();
+
+// Check position
+let position = bot.position(0);
+println!("Current position: {}", position);
+```
+
+### Error Handling
+
+```rust
+use hftbacktest::{
+    live::{Instrument, LiveBot},
+    types::{ErrorKind, LiveError},
+};
+
+let mut bot = LiveBot::builder()
+    .register(Instrument::new(
+        "binance",
+        "BTCUSDT",
+        0.01,
+        0.001,
+        HashMapMarketDepth::new(0.01, 0.001),
+        100
+    ))
+    .error_handler(|error: LiveError| {
+        match error.kind {
+            ErrorKind::ConnectionInterrupted => {
+                eprintln!("Connection interrupted, attempting reconnect...");
+                Ok(())
+            }
+            ErrorKind::CriticalConnectionError => {
+                eprintln!("Critical error: {:?}", error.value());
+                Err(BotError::Interrupted)
+            }
+            ErrorKind::OrderError => {
+                eprintln!("Order error: {:?}", error.value());
+                Ok(())
+            }
+            ErrorKind::Custom(code) => {
+                eprintln!("Custom error {}: {:?}", code, error.value());
+                Ok(())
+            }
+        }
+    })
+    .build()?;
+```
+
+### Order Response Hook
+
+```rust
+use hftbacktest::{
+    live::{Instrument, LiveBot},
+    types::{Order, Status},
+};
+
+let mut bot = LiveBot::builder()
+    .register(Instrument::new(
+        "binance",
+        "BTCUSDT",
+        0.01,
+        0.001,
+        HashMapMarketDepth::new(0.01, 0.001),
+        100
+    ))
+    .order_recv_hook(|existing: &Order, update: &Order| {
+        // Log order state transitions
+        if existing.status != update.status {
+            println!(
+                "Order {} status: {:?} -> {:?}",
+                update.order_id,
+                existing.status,
+                update.status
+            );
+        }
+        
+        // Track fills
+        if update.status == Status::Filled || update.status == Status::PartiallyFilled {
+            let filled_qty = update.qty - update.leaves_qty;
+            println!(
+                "Order {} filled: {} @ {}",
+                update.order_id,
+                filled_qty,
+                update.exec_price()
+            );
+        }
+        
+        Ok(())
+    })
+    .build()?;
+```
+
+## Unified Interface
+
+The key advantage of the live module is that it implements the same `Bot` trait as the backtester, allowing you to run the same strategy code in both backtesting and live trading:
+
+```rust
+use hftbacktest::prelude::*;
+
+fn run_strategy<B>(bot: &mut B) -> Result<(), B::Error>
+where
+    B: Bot<HashMapMarketDepth>,
+{
+    let asset_no = 0;
+    
+    // This code works for both Backtest and LiveBot
+    loop {
+        let depth = bot.depth(asset_no);
+        let mid = (depth.best_bid() + depth.best_ask()) / 2.0;
+        
+        // Your strategy logic here
+        
+        bot.elapse(1_000_000_000)?; // 1 second
+    }
+}
+
+// Use with backtest
+let mut backtest = Backtest::builder()...build()?;
+run_strategy(&mut backtest)?;
+
+// Use with live bot
+let mut live_bot = LiveBot::builder()...build()?;
+run_strategy(&mut live_bot)?;
+```
+
+## Recorder
+
+The live module also provides a `LoggingRecorder` for logging trading statistics.
+
+```rust
+pub struct LoggingRecorder {
+    // Internal fields
+}
+```
+
+See the [Recorder trait](/api/rust/types#recorder-trait) for usage details.

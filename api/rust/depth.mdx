@@ -1,0 +1,386 @@
+---
+title: Market Depth Module
+description: Order book and market depth implementations
+---
+
+The `depth` module provides market depth (order book) implementations and traits for managing Level-1, Level-2, and Level-3 market data.
+
+## Core Traits
+
+### MarketDepth
+
+Provides the basic market depth interface for accessing best bid/ask and quantities.
+
+```rust
+pub trait MarketDepth {
+    fn best_bid(&self) -> f64;
+    fn best_ask(&self) -> f64;
+    fn best_bid_tick(&self) -> i64;
+    fn best_ask_tick(&self) -> i64;
+    fn best_bid_qty(&self) -> f64;
+    fn best_ask_qty(&self) -> f64;
+    fn tick_size(&self) -> f64;
+    fn lot_size(&self) -> f64;
+    fn bid_qty_at_tick(&self, price_tick: i64) -> f64;
+    fn ask_qty_at_tick(&self, price_tick: i64) -> f64;
+}
+```
+
+**Methods:**
+
+- `best_bid()` - Returns the best bid price, or `f64::NAN` if no bid exists
+- `best_ask()` - Returns the best ask price, or `f64::NAN` if no ask exists
+- `best_bid_tick()` - Returns the best bid price in ticks, or `INVALID_MIN` if no bid
+- `best_ask_tick()` - Returns the best ask price in ticks, or `INVALID_MAX` if no ask
+- `best_bid_qty()` - Returns the quantity at the best bid
+- `best_ask_qty()` - Returns the quantity at the best ask
+- `tick_size()` - Returns the minimum price increment
+- `lot_size()` - Returns the minimum quantity increment
+- `bid_qty_at_tick(price_tick)` - Returns bid quantity at a specific price level
+- `ask_qty_at_tick(price_tick)` - Returns ask quantity at a specific price level
+
+### L2MarketDepth
+
+Provides Level-2 (Market-By-Price) specific functions for order book updates.
+
+```rust
+pub trait L2MarketDepth {
+    fn update_bid_depth(
+        &mut self,
+        price: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> (i64, i64, i64, f64, f64, i64);
+    
+    fn update_ask_depth(
+        &mut self,
+        price: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> (i64, i64, i64, f64, f64, i64);
+    
+    fn clear_depth(&mut self, side: Side, clear_upto_price: f64);
+}
+```
+
+**Methods:**
+
+- `update_bid_depth(price, qty, timestamp)` - Updates bid side and returns `(price_tick, prev_best_bid_tick, best_bid_tick, prev_qty, qty, timestamp)`
+- `update_ask_depth(price, qty, timestamp)` - Updates ask side and returns `(price_tick, prev_best_ask_tick, best_ask_tick, prev_qty, qty, timestamp)`
+- `clear_depth(side, clear_upto_price)` - Clears market depth for the specified side
+
+### L3MarketDepth
+
+Provides Level-3 (Market-By-Order) specific functions for individual order tracking.
+
+```rust
+pub trait L3MarketDepth: MarketDepth {
+    type Error;
+    
+    fn add_buy_order(
+        &mut self,
+        order_id: OrderId,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> Result<(i64, i64), Self::Error>;
+    
+    fn add_sell_order(
+        &mut self,
+        order_id: OrderId,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> Result<(i64, i64), Self::Error>;
+    
+    fn delete_order(
+        &mut self,
+        order_id: OrderId,
+        timestamp: i64,
+    ) -> Result<(Side, i64, i64), Self::Error>;
+    
+    fn modify_order(
+        &mut self,
+        order_id: OrderId,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> Result<(Side, i64, i64), Self::Error>;
+    
+    fn clear_orders(&mut self, side: Side);
+    
+    fn orders(&self) -> &HashMap<OrderId, L3Order>;
+}
+```
+
+**Methods:**
+
+- `add_buy_order(order_id, px, qty, timestamp)` - Adds a buy order and returns `(prev_best_bid_tick, best_bid_tick)`
+- `add_sell_order(order_id, px, qty, timestamp)` - Adds a sell order and returns `(prev_best_ask_tick, best_ask_tick)`
+- `delete_order(order_id, timestamp)` - Removes an order and returns `(side, prev_best_tick, best_tick)`
+- `modify_order(order_id, px, qty, timestamp)` - Modifies an order and returns `(side, prev_best_tick, best_tick)`
+- `clear_orders(side)` - Clears all orders on the specified side
+- `orders()` - Returns all orders in the book
+
+### L1MarketDepth
+
+Provides Level-1 (BBO - Best Bid/Offer) specific functions.
+
+```rust
+pub trait L1MarketDepth {
+    fn update_best_bid(
+        &mut self,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> (i64, i64, i64, f64, f64, i64);
+    
+    fn update_best_ask(
+        &mut self,
+        px: f64,
+        qty: f64,
+        timestamp: i64,
+    ) -> (i64, i64, i64, f64, f64, i64);
+}
+```
+
+## Implementations
+
+### HashMapMarketDepth
+
+A `HashMap`-based market depth implementation suitable for sparse order books.
+
+```rust
+pub struct HashMapMarketDepth {
+    // Internal fields
+}
+
+impl HashMapMarketDepth {
+    pub fn new(tick_size: f64, lot_size: f64) -> Self
+}
+```
+
+**Characteristics:**
+- Efficient for sparse order books
+- Good performance for market-making strategies
+- Implements both `L2MarketDepth` and `L3MarketDepth`
+
+**Example:**
+
+```rust
+use hftbacktest::depth::{HashMapMarketDepth, MarketDepth};
+
+let mut depth = HashMapMarketDepth::new(0.01, 1.0);
+
+let best_bid = depth.best_bid();
+let best_ask = depth.best_ask();
+```
+
+### BTreeMarketDepth
+
+A `BTreeMap`-based market depth implementation with ordered price levels.
+
+```rust
+pub struct BTreeMarketDepth {
+    // Internal fields
+}
+
+impl BTreeMarketDepth {
+    pub fn new(tick_size: f64, lot_size: f64) -> Self
+}
+```
+
+**Characteristics:**
+- Maintains sorted price levels
+- Efficient range queries
+- Slightly slower updates than HashMap
+
+### ROIVectorMarketDepth
+
+A vector-based implementation optimized for a specific range of interest (ROI).
+
+```rust
+pub struct ROIVectorMarketDepth {
+    // Internal fields
+}
+
+impl ROIVectorMarketDepth {
+    pub fn new(
+        tick_size: f64,
+        lot_size: f64,
+        roi_lb: i64,
+        roi_ub: i64,
+    ) -> Self
+}
+```
+
+**Characteristics:**
+- Extremely fast access within the ROI range
+- Fixed memory allocation
+- Best for high-frequency strategies with predictable price ranges
+
+**Parameters:**
+- `roi_lb` - Lower bound of the range of interest (in ticks)
+- `roi_ub` - Upper bound of the range of interest (in ticks)
+
+**Example:**
+
+```rust
+use hftbacktest::depth::ROIVectorMarketDepth;
+
+// ROI from tick 1000 to 2000
+let mut depth = ROIVectorMarketDepth::new(0.01, 1.0, 1000, 2000);
+```
+
+### FusedHashMapMarketDepth
+
+A fused implementation that combines multiple market depth sources.
+
+```rust
+pub struct FusedHashMapMarketDepth {
+    // Internal fields
+}
+```
+
+**Characteristics:**
+- Merges multiple depth feeds
+- Useful for cross-exchange arbitrage
+- Maintains synchronized view across sources
+
+## Supporting Types
+
+### L3Order
+
+Represents a Level-3 order in the order book.
+
+```rust
+pub struct L3Order {
+    pub order_id: OrderId,
+    pub side: Side,
+    pub price_tick: i64,
+    pub qty: f64,
+    pub timestamp: i64,
+}
+```
+
+### Constants
+
+```rust
+/// Represents no best bid in ticks
+pub const INVALID_MIN: i64 = i64::MIN;
+
+/// Represents no best ask in ticks
+pub const INVALID_MAX: i64 = i64::MAX;
+```
+
+These constants are returned when there is no valid bid or ask in the order book.
+
+## ApplySnapshot Trait
+
+Provides functionality to initialize market depth from snapshot data.
+
+```rust
+pub trait ApplySnapshot {
+    fn apply_snapshot(&mut self, data: &Data<Event>);
+    fn snapshot(&self) -> Vec<Event>;
+}
+```
+
+**Methods:**
+
+- `apply_snapshot(data)` - Initializes the order book from snapshot events
+- `snapshot()` - Exports the current order book as snapshot events
+
+## Usage Examples
+
+### Basic Market Depth Access
+
+```rust
+use hftbacktest::{
+    depth::{HashMapMarketDepth, MarketDepth},
+    types::Side,
+};
+
+let mut depth = HashMapMarketDepth::new(0.01, 1.0);
+
+// Check best bid and ask
+if depth.best_bid().is_nan() {
+    println!("No bids in the book");
+} else {
+    println!("Best bid: {} @ {}", depth.best_bid(), depth.best_bid_qty());
+}
+
+if depth.best_ask().is_nan() {
+    println!("No asks in the book");
+} else {
+    println!("Best ask: {} @ {}", depth.best_ask(), depth.best_ask_qty());
+}
+```
+
+### Level-2 Order Book Updates
+
+```rust
+use hftbacktest::depth::{HashMapMarketDepth, L2MarketDepth, MarketDepth};
+use hftbacktest::types::Side;
+
+let mut depth = HashMapMarketDepth::new(0.01, 1.0);
+
+// Update bid side
+let (price_tick, prev_best, best, prev_qty, qty, ts) = 
+    depth.update_bid_depth(100.0, 50.0, 1000000);
+
+println!("Updated bid: price={}, qty={}", 100.0, 50.0);
+println!("Best bid changed: {} -> {}", prev_best, best);
+
+// Update ask side
+let (price_tick, prev_best, best, prev_qty, qty, ts) = 
+    depth.update_ask_depth(100.05, 30.0, 1000000);
+
+// Clear one side
+depth.clear_depth(Side::Buy, 0.0);
+```
+
+### Level-3 Order Book Management
+
+```rust
+use hftbacktest::depth::{HashMapMarketDepth, L3MarketDepth, MarketDepth};
+
+let mut depth = HashMapMarketDepth::new(0.01, 1.0);
+
+// Add individual orders
+let (prev_best, best) = depth.add_buy_order(12345, 100.0, 10.0, 1000000)?;
+let (prev_best, best) = depth.add_sell_order(12346, 100.05, 15.0, 1000000)?;
+
+// Modify an order
+let (side, prev_best, best) = depth.modify_order(12345, 100.01, 12.0, 1000000)?;
+
+// Delete an order
+let (side, prev_best, best) = depth.delete_order(12345, 1000000)?;
+
+// Get all orders
+let orders = depth.orders();
+for (order_id, order) in orders {
+    println!("Order {}: {} {} @ {}", 
+        order_id, 
+        order.qty, 
+        order.side, 
+        order.price_tick
+    );
+}
+```
+
+### Choosing the Right Implementation
+
+```rust
+use hftbacktest::depth::*;
+
+// For sparse books or unknown price ranges
+let depth = HashMapMarketDepth::new(0.01, 1.0);
+
+// For strategies requiring deep book analysis
+let depth = BTreeMarketDepth::new(0.01, 1.0);
+
+// For high-frequency strategies with known price range
+// ROI: 99.00 to 101.00 (ticks 9900 to 10100 with tick_size=0.01)
+let depth = ROIVectorMarketDepth::new(0.01, 1.0, 9900, 10100);
+```

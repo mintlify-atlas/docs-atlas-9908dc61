@@ -1,0 +1,488 @@
+---
+title: Market Making Strategies
+description: Build sophisticated market making strategies with proper pricing, skewing, and risk management
+---
+
+Market making involves continuously quoting both bid and ask prices to capture the spread while managing inventory risk. HftBacktest provides the tools to implement and backtest sophisticated market making strategies.
+
+## Basic Market Making Concept
+
+A market maker:
+
+1. Posts limit orders on both sides of the order book
+2. Earns the spread when both orders fill
+3. Manages inventory (position) risk through skewing
+4. Adjusts quotes based on market conditions
+
+## Simple Market Making Example
+
+Here's a basic two-sided market making strategy:
+
+```python
+import numpy as np
+from numba import njit
+from hftbacktest import (
+    BacktestAsset,
+    HashMapMarketDepthBacktest,
+    BUY,
+    SELL,
+    GTX,
+    LIMIT
+)
+
+@njit
+def simple_market_maker(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    lot_size = hbt.depth(asset_no).lot_size
+    
+    # Parameters
+    half_spread_ticks = 20
+    order_qty = 0.1
+    max_position = 5.0
+    
+    # Run every 100ms
+    while hbt.elapse(100_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Calculate bid and ask prices
+        bid_price = mid_price - (half_spread_ticks * tick_size)
+        ask_price = mid_price + (half_spread_ticks * tick_size)
+        
+        # Align to tick grid
+        bid_price_tick = round(bid_price / tick_size)
+        ask_price_tick = round(ask_price / tick_size)
+        
+        # Ensure we don't cross the market
+        bid_price_tick = min(bid_price_tick, depth.best_bid_tick)
+        ask_price_tick = max(ask_price_tick, depth.best_ask_tick)
+        
+        # Submit orders with position limits
+        if position < max_position:
+            hbt.submit_buy_order(
+                asset_no,
+                bid_price_tick,
+                bid_price_tick * tick_size,
+                order_qty,
+                GTX,
+                LIMIT,
+                False
+            )
+        
+        if position > -max_position:
+            hbt.submit_sell_order(
+                asset_no,
+                ask_price_tick,
+                ask_price_tick * tick_size,
+                order_qty,
+                GTX,
+                LIMIT,
+                False
+            )
+    
+    return True
+```
+
+<Note>
+Use `GTX` (Good-Til-Crossing) time-in-force to ensure your orders provide liquidity and don't cross the spread.
+</Note>
+
+## Pricing Framework
+
+Sophisticated market makers use a reservation price that accounts for alpha and risk:
+
+```python
+@njit
+def advanced_pricing(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    while hbt.elapse(10_000_000) == 0:  # Every 10ms
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Components of reservation price
+        a = 1.0  # Alpha coefficient
+        b = 1.0  # Risk coefficient
+        c = 1.0  # Spread coefficient
+        
+        # Alpha: your forecast of where price is heading
+        forecast = 0.0  # Replace with your alpha signal
+        
+        # Volatility: measure of market risk
+        volatility = 0.0  # Calculate from recent price changes
+        
+        # Risk: based on position
+        risk = (c + volatility) * position
+        
+        # Half spread
+        half_spread = (c + volatility) * 1.0  # Base spread times risk
+        
+        # Reservation price
+        reservation_price = mid_price + a * forecast - b * risk
+        
+        # Final quotes
+        bid = reservation_price - half_spread
+        ask = reservation_price + half_spread
+        
+        # Round to tick size
+        bid_tick = round(bid / tick_size)
+        ask_tick = round(ask / tick_size)
+```
+
+## Position-Based Skewing
+
+Skew your quotes based on inventory to manage risk:
+
+```python
+@njit
+def skewed_market_maker(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    max_position = 5.0
+    base_half_spread = 20  # ticks
+    skew_per_unit = 2  # ticks per unit of position
+    
+    while hbt.elapse(100_000_000) == 0:
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        
+        mid_price_tick = (depth.best_bid_tick + depth.best_ask_tick) / 2.0
+        
+        # Calculate skew in ticks
+        skew_ticks = skew_per_unit * position
+        
+        # Apply skew to quotes
+        bid_tick = round(mid_price_tick - base_half_spread - skew_ticks)
+        ask_tick = round(mid_price_tick + base_half_spread - skew_ticks)
+        
+        # When long, skew pushes both quotes down (easier to sell)
+        # When short, skew pushes both quotes up (easier to buy)
+        
+        # ... submit orders
+```
+
+<Warning>
+Proper position skewing is essential. Without it, your strategy will accumulate dangerous inventory.
+</Warning>
+
+## GLFT Market Making Model
+
+The Guéant–Lehalle–Fernandez-Tapia model provides optimal quote depths:
+
+```python
+import numpy as np
+from numba import njit
+
+@njit
+def compute_glft_coeff(gamma, delta, A, k):
+    """Calculate GLFT model coefficients"""
+    inv_k = 1.0 / k
+    c1 = (1.0 / (gamma * delta)) * np.log(1 + gamma * delta * inv_k)
+    c2 = np.sqrt(
+        (gamma / (2 * A * delta * k)) * 
+        ((1 + gamma * delta * inv_k) ** (k / (gamma * delta) + 1))
+    )
+    return c1, c2
+
+@njit
+def glft_market_maker(hbt, volatility, A, k):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    # Model parameters
+    gamma = 0.05  # Risk aversion
+    delta = 1.0   # Lot size adjustment
+    
+    while hbt.elapse(100_000_000) == 0:
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        
+        mid_price_tick = (depth.best_bid_tick + depth.best_ask_tick) / 2.0
+        
+        # Calculate coefficients
+        c1, c2 = compute_glft_coeff(gamma, delta, A, k)
+        
+        # Half spread and skew (in ticks)
+        half_spread_tick = c1 + (delta / 2.0) * c2 * volatility
+        skew = c2 * volatility
+        
+        # Reservation price with position skew
+        reservation_price_tick = mid_price_tick - skew * position
+        
+        # Final quotes
+        bid_tick = round(reservation_price_tick - half_spread_tick)
+        ask_tick = round(reservation_price_tick + half_spread_tick)
+        
+        # ... submit orders
+```
+
+<Note>
+The GLFT model requires calibrating `A` and `k` from market trade intensity. See the [GLFT tutorial](https://hftbacktest.readthedocs.io/en/latest/tutorials/GLFT%20Market%20Making%20Model%20and%20Grid%20Trading.html) for details.
+</Note>
+
+## Order Book Imbalance Alpha
+
+Use order book imbalance as a short-term alpha signal:
+
+```python
+@njit
+def imbalance_alpha(hbt):
+    asset_no = 0
+    
+    while hbt.elapse(100_000_000) == 0:
+        depth = hbt.depth(asset_no)
+        
+        # Get quantities at multiple levels
+        bid_qty = 0.0
+        ask_qty = 0.0
+        
+        # Sum top 5 levels (example - actual implementation depends on depth interface)
+        for i in range(5):
+            # bid_qty += depth.bid_qty_at_level(i)
+            # ask_qty += depth.ask_qty_at_level(i)
+            pass
+        
+        # Calculate imbalance
+        if bid_qty + ask_qty > 0:
+            imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty)
+        else:
+            imbalance = 0.0
+        
+        # Use imbalance as forecast
+        # Positive imbalance = more bids = price likely to rise
+        forecast = imbalance * 0.5  # Scale appropriately
+        
+        # ... use forecast in reservation price
+```
+
+## Fee Considerations
+
+Account for maker/taker fees in your pricing:
+
+```python
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240809.npz'])
+        # Maker rebate: -0.005%, Taker fee: 0.02%
+        .trading_value_fee_model(-0.00005, 0.0002)
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+```
+
+<Note>
+Maker rebates significantly impact profitability. The examples use 0.005% maker rebate, the highest tier on Binance Futures.
+</Note>
+
+## Risk Management
+
+<Steps>
+
+### Position Limits
+
+Enforce maximum position sizes:
+
+```python
+max_position = 10.0
+
+if position < max_position:
+    # Submit buy order
+    pass
+
+if position > -max_position:
+    # Submit sell order
+    pass
+```
+
+### Notional Limits
+
+Use notional value for better risk control:
+
+```python
+max_notional = 100_000
+position_value = position * mid_price
+
+if position_value < max_notional:
+    # Submit buy order
+    pass
+```
+
+### Spread Constraints
+
+Avoid quoting in extreme market conditions:
+
+```python
+max_spread_bps = 50  # Max 50 basis points
+spread = depth.best_ask - depth.best_bid
+spread_bps = (spread / mid_price) * 10000
+
+if spread_bps > max_spread_bps:
+    # Market too wide - don't quote
+    return
+```
+
+</Steps>
+
+## Performance Optimization
+
+### Use ROI Vector for Speed
+
+For active market making in a price range:
+
+```python
+from hftbacktest import ROIVectorMarketDepthBacktest
+
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240809.npz'])
+        .roi_lb(60000.0)
+        .roi_ub(65000.0)
+)
+
+hbt = ROIVectorMarketDepthBacktest([asset])
+```
+
+### Reduce Elapse Frequency
+
+Balance reactiveness with computation:
+
+```python
+# Too fast: high CPU, minimal benefit
+while hbt.elapse(1_000_000) == 0:  # 1ms
+
+# Good balance for most strategies
+while hbt.elapse(100_000_000) == 0:  # 100ms
+
+# Too slow: may miss opportunities
+while hbt.elapse(1_000_000_000) == 0:  # 1s
+```
+
+## Complete Market Making Example
+
+```python
+import numpy as np
+from numba import njit
+from hftbacktest import (
+    BacktestAsset,
+    ROIVectorMarketDepthBacktest,
+    Recorder,
+    BUY,
+    SELL,
+    GTX,
+    LIMIT
+)
+
+@njit
+def market_making_strategy(hbt, recorder):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    lot_size = hbt.depth(asset_no).lot_size
+    
+    # Parameters
+    half_spread_ticks = 20
+    order_qty = 0.1
+    max_position = 5.0
+    skew_coefficient = 2.0
+    
+    while hbt.elapse(100_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+        
+        mid_price_tick = (depth.best_bid_tick + depth.best_ask_tick) / 2.0
+        
+        # Position-based skew
+        skew_ticks = skew_coefficient * position
+        
+        # Calculate quotes
+        reservation_price_tick = mid_price_tick - skew_ticks
+        bid_tick = round(reservation_price_tick - half_spread_ticks)
+        ask_tick = round(reservation_price_tick + half_spread_ticks)
+        
+        # Don't cross the market
+        bid_tick = min(bid_tick, depth.best_bid_tick)
+        ask_tick = max(ask_tick, depth.best_ask_tick)
+        
+        # Cancel orders not at target prices
+        order_values = orders.values()
+        while order_values.has_next():
+            order = order_values.get()
+            if order.cancellable:
+                if (order.side == BUY and order.price_tick != bid_tick) or \
+                   (order.side == SELL and order.price_tick != ask_tick):
+                    hbt.cancel(asset_no, order.order_id, False)
+        
+        # Submit new orders if needed
+        if position < max_position and bid_tick not in orders:
+            hbt.submit_buy_order(
+                asset_no,
+                bid_tick,
+                bid_tick * tick_size,
+                order_qty,
+                GTX,
+                LIMIT,
+                False
+            )
+        
+        if position > -max_position and ask_tick not in orders:
+            hbt.submit_sell_order(
+                asset_no,
+                ask_tick,
+                ask_tick * tick_size,
+                order_qty,
+                GTX,
+                LIMIT,
+                False
+            )
+        
+        recorder.record(hbt)
+    
+    return True
+
+# Setup and run
+asset = (
+    BacktestAsset()
+        .data(['data/ethusdt_20221003.npz'])
+        .initial_snapshot('data/ethusdt_20221002_eod.npz')
+        .linear_asset(1.0)
+        .constant_latency(10_000_000, 10_000_000)
+        .power_prob_queue_model(2.0)
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .tick_size(0.01)
+        .lot_size(0.001)
+        .roi_lb(1000.0)
+        .roi_ub(2000.0)
+)
+
+hbt = ROIVectorMarketDepthBacktest([asset])
+recorder = Recorder(1, 5_000_000)
+
+market_making_strategy(hbt, recorder.recorder)
+_ = hbt.close()
+
+# Analyze results
+from hftbacktest.stats import LinearAssetRecord
+
+stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000)
+print(stats.summary())
+stats.plot()
+```
+
+## Next Steps
+
+- Learn about [Grid Trading](/guides/grid-trading)
+- Explore [Multi-Market Strategies](/guides/multi-market)
+- See [Live Trading Deployment](/guides/live-trading)
+- Read the [GLFT Model Tutorial](https://hftbacktest.readthedocs.io/en/latest/tutorials/GLFT%20Market%20Making%20Model%20and%20Grid%20Trading.html)

@@ -1,0 +1,435 @@
+---
+title: Types and Constants
+description: Type definitions, constants, and data structures used in HftBacktest
+---
+
+## Event Types
+
+Constants for identifying different types of market events.
+
+<ResponseField name="DEPTH_EVENT" type="int" default="1">
+  Market depth change event.
+  
+  ```python
+  from hftbacktest import DEPTH_EVENT
+  
+  if event['ev'] & DEPTH_EVENT:
+      # Process depth update
+      pass
+  ```
+</ResponseField>
+
+<ResponseField name="TRADE_EVENT" type="int" default="2">
+  Trade execution event in the market.
+</ResponseField>
+
+<ResponseField name="DEPTH_CLEAR_EVENT" type="int" default="3">
+  Market depth cleared event.
+</ResponseField>
+
+<ResponseField name="DEPTH_SNAPSHOT_EVENT" type="int" default="4">
+  Market depth snapshot received event.
+</ResponseField>
+
+<ResponseField name="DEPTH_BBO_EVENT" type="int" default="5">
+  Best bid and offer update event.
+</ResponseField>
+
+<ResponseField name="ADD_ORDER_EVENT" type="int" default="10">
+  Order added to the order book (Level-3).
+</ResponseField>
+
+<ResponseField name="CANCEL_ORDER_EVENT" type="int" default="11">
+  Order cancelled from the order book (Level-3).
+</ResponseField>
+
+<ResponseField name="MODIFY_ORDER_EVENT" type="int" default="12">
+  Order modified in the order book (Level-3).
+</ResponseField>
+
+<ResponseField name="FILL_EVENT" type="int" default="13">
+  Order filled in the order book (Level-3).
+</ResponseField>
+
+## Event Flags
+
+Bit flags for event processing.
+
+<ResponseField name="EXCH_EVENT" type="int" default="1 << 31">
+  Event to be processed by the exchange at the exchange timestamp.
+  
+  ```python
+  from hftbacktest import EXCH_EVENT
+  
+  # Check if event should be processed at exchange
+  if event['ev'] & EXCH_EVENT:
+      # Process at exchange timestamp
+      pass
+  ```
+</ResponseField>
+
+<ResponseField name="LOCAL_EVENT" type="int" default="1 << 30">
+  Event to be processed locally at the local timestamp.
+</ResponseField>
+
+<ResponseField name="BUY_EVENT" type="int" default="1 << 29">
+  Indicates a buy-side event. For depth events, this means bid-side. For trade events, the initiator is a buyer.
+</ResponseField>
+
+<ResponseField name="SELL_EVENT" type="int" default="1 << 28">
+  Indicates a sell-side event. For depth events, this means ask-side. For trade events, the initiator is a seller.
+</ResponseField>
+
+## Order Side
+
+<ResponseField name="BUY" type="int" default="1">
+  Buy order side.
+  
+  ```python
+  from hftbacktest import BUY, SELL
+  
+  if order.side == BUY:
+      print("Buy order")
+  elif order.side == SELL:
+      print("Sell order")
+  ```
+</ResponseField>
+
+<ResponseField name="SELL" type="int" default="-1">
+  Sell order side.
+</ResponseField>
+
+## Order Status
+
+<ResponseField name="NONE" type="int" default="0">
+  No status (initial state).
+</ResponseField>
+
+<ResponseField name="NEW" type="int" default="1">
+  Order is active in the order book.
+  
+  ```python
+  from hftbacktest import NEW, FILLED
+  
+  if order.status == NEW:
+      # Order is active
+      pass
+  elif order.status == FILLED:
+      # Order is filled
+      pass
+  ```
+</ResponseField>
+
+<ResponseField name="EXPIRED" type="int" default="2">
+  Order has expired.
+</ResponseField>
+
+<ResponseField name="FILLED" type="int" default="3">
+  Order is completely filled.
+</ResponseField>
+
+<ResponseField name="CANCELED" type="int" default="4">
+  Order has been cancelled.
+</ResponseField>
+
+<ResponseField name="PARTIALLY_FILLED" type="int" default="5">
+  Order is partially filled.
+</ResponseField>
+
+<ResponseField name="REJECTED" type="int" default="6">
+  Order has been rejected.
+</ResponseField>
+
+## Time-In-Force
+
+<ResponseField name="GTC" type="int" default="0">
+  Good 'Till Cancel - Order remains active until filled or explicitly cancelled.
+  
+  ```python
+  from hftbacktest import GTC, GTX
+  
+  # Regular limit order
+  hbt.submit_buy_order(
+      asset_no=0,
+      order_id=1,
+      price=50000.0,
+      qty=0.01,
+      time_in_force=GTC,
+      order_type=LIMIT,
+      wait=False
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="GTX" type="int" default="1">
+  Good 'Till Crossing (Post-Only) - Order will be rejected if it would match immediately. Ensures maker status.
+</ResponseField>
+
+<ResponseField name="FOK" type="int" default="2">
+  Fill Or Kill - Order must be filled immediately in its entirety or cancelled.
+</ResponseField>
+
+<ResponseField name="IOC" type="int" default="3">
+  Immediate Or Cancel - Order must be filled immediately (partially or fully), with unfilled portion cancelled.
+</ResponseField>
+
+## Order Type
+
+<ResponseField name="LIMIT" type="int" default="0">
+  Limit order - Order with a specified price.
+  
+  ```python
+  from hftbacktest import LIMIT, MARKET
+  
+  # Limit order at specific price
+  hbt.submit_buy_order(
+      asset_no=0,
+      order_id=1,
+      price=50000.0,
+      qty=0.01,
+      time_in_force=GTX,
+      order_type=LIMIT,
+      wait=False
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="MARKET" type="int" default="1">
+  Market order - Order executed at the best available price.
+</ResponseField>
+
+## Special Constants
+
+<ResponseField name="ALL_ASSETS" type="int" default="-1">
+  Constant used to indicate operations should apply to all assets.
+  
+  ```python
+  from hftbacktest import ALL_ASSETS
+  
+  # Clear inactive orders for all assets
+  hbt.clear_inactive_orders(ALL_ASSETS)
+  
+  # Clear last trades for all assets
+  hbt.clear_last_trades(ALL_ASSETS)
+  ```
+</ResponseField>
+
+<ResponseField name="UNTIL_END_OF_DATA" type="int" default="9223372036854775807">
+  Maximum int64 value, used to continue processing until the end of data.
+</ResponseField>
+
+## Data Types
+
+### event_dtype
+
+NumPy structured dtype for market events.
+
+```python
+import numpy as np
+from hftbacktest.binding import event_dtype
+
+# Create an array of events
+events = np.zeros(100, dtype=event_dtype)
+```
+
+**Fields:**
+- `ev` (uint64): Event flags and type
+- `exch_ts` (int64): Exchange timestamp
+- `local_ts` (int64): Local timestamp
+- `px` (float64): Price
+- `qty` (float64): Quantity
+- `order_id` (uint64): Order ID (for Level-3 events)
+- `ival` (int64): Integer value field
+- `fval` (float64): Float value field
+
+**Example:**
+
+```python
+from hftbacktest import DEPTH_EVENT, BUY_EVENT, EXCH_EVENT, LOCAL_EVENT
+
+# Create a depth event
+event = np.zeros(1, dtype=event_dtype)[0]
+event['ev'] = DEPTH_EVENT | BUY_EVENT | EXCH_EVENT | LOCAL_EVENT
+event['exch_ts'] = 1704067200_000_000_000  # Unix timestamp in nanoseconds
+event['local_ts'] = 1704067200_100_000_000  # 100ms latency
+event['px'] = 50000.0
+event['qty'] = 1.5
+```
+
+### order_dtype
+
+NumPy structured dtype for orders.
+
+**Fields:**
+- `qty` (float64): Order quantity
+- `leaves_qty` (float64): Remaining quantity
+- `exec_qty` (float64): Executed quantity
+- `exec_price_tick` (int64): Executed price in ticks
+- `price_tick` (int64): Order price in ticks
+- `tick_size` (float64): Tick size
+- `exch_timestamp` (int64): Exchange timestamp
+- `local_timestamp` (int64): Local timestamp
+- `order_id` (uint64): Order ID
+- `maker` (bool): Whether order is maker
+- `order_type` (uint8): Order type
+- `req` (uint8): Current request type
+- `status` (uint8): Order status
+- `side` (int8): Order side
+- `time_in_force` (uint8): Time-in-force
+
+### state_values_dtype
+
+NumPy structured dtype for state values.
+
+**Fields:**
+- `position` (float64): Current position
+- `balance` (float64): Cash balance
+- `fee` (float64): Accumulated fees
+- `num_trades` (int64): Number of trades
+- `trading_volume` (float64): Total trading volume
+- `trading_value` (float64): Total trading value
+
+```python
+from hftbacktest.types import state_values_dtype
+import numpy as np
+
+# Access state values
+state = hbt.state_values(0)
+print(f"Position: {state.position}")
+print(f"Balance: {state.balance}")
+print(f"Fees: {state.fee}")
+```
+
+### record_dtype
+
+NumPy structured dtype for recording backtest state over time.
+
+**Fields:**
+- `timestamp` (int64): Record timestamp
+- `price` (float64): Mid price
+- `position` (float64): Position
+- `balance` (float64): Balance
+- `fee` (float64): Accumulated fee
+- `num_trades` (int64): Number of trades
+- `trading_volume` (float64): Trading volume
+- `trading_value` (float64): Trading value
+
+```python
+from hftbacktest import Recorder
+
+recorder = Recorder(num_assets=1, record_size=10000)
+
+# Inside your strategy
+@njit
+def strategy(hbt, recorder):
+    while hbt.elapse(10_000_000) == 0:
+        # Record state every iteration
+        recorder.record(hbt)
+        # ... strategy logic ...
+
+# After backtest
+recorder.to_npz('backtest_results.npz')
+```
+
+## Type Hints
+
+<ResponseField name="EVENT_ARRAY" type="type">
+  Type alias for NumPy arrays with `event_dtype`.
+  
+  ```python
+  from hftbacktest.types import EVENT_ARRAY
+  import numpy as np
+  
+  def process_events(events: EVENT_ARRAY) -> None:
+      for i in range(len(events)):
+          print(events[i].px, events[i].qty)
+  ```
+</ResponseField>
+
+## Usage Examples
+
+### Checking Event Types
+
+```python
+from hftbacktest import DEPTH_EVENT, TRADE_EVENT, BUY_EVENT, SELL_EVENT
+
+def process_event(event):
+    # Check event type
+    if event['ev'] & DEPTH_EVENT:
+        if event['ev'] & BUY_EVENT:
+            print(f"Bid update: {event['px']} @ {event['qty']}")
+        elif event['ev'] & SELL_EVENT:
+            print(f"Ask update: {event['px']} @ {event['qty']}")
+    elif event['ev'] & TRADE_EVENT:
+        if event['ev'] & BUY_EVENT:
+            print(f"Buy trade: {event['px']} @ {event['qty']}")
+        else:
+            print(f"Sell trade: {event['px']} @ {event['qty']}")
+```
+
+### Working with Orders
+
+```python
+from hftbacktest import BUY, SELL, NEW, FILLED, CANCELED
+
+def check_orders(hbt, asset_no):
+    orders = hbt.orders(asset_no)
+    
+    # Iterate through all orders
+    values = orders.values()
+    while values.has_next():
+        order = values.get()
+        
+        if order.side == BUY:
+            side_str = "Buy"
+        else:
+            side_str = "Sell"
+        
+        if order.status == NEW:
+            status_str = "Active"
+        elif order.status == FILLED:
+            status_str = "Filled"
+        elif order.status == CANCELED:
+            status_str = "Cancelled"
+        else:
+            status_str = "Other"
+        
+        print(f"{side_str} order {order.order_id}: {order.price} @ {order.qty} - {status_str}")
+```
+
+### Creating Market Data
+
+```python
+import numpy as np
+from hftbacktest.binding import event_dtype
+from hftbacktest import DEPTH_EVENT, BUY_EVENT, SELL_EVENT, EXCH_EVENT, LOCAL_EVENT
+
+def create_depth_update(timestamp, price, qty, is_bid, latency_ns=100_000):
+    event = np.zeros(1, dtype=event_dtype)[0]
+    
+    # Set event type and flags
+    event['ev'] = DEPTH_EVENT | EXCH_EVENT | LOCAL_EVENT
+    if is_bid:
+        event['ev'] |= BUY_EVENT
+    else:
+        event['ev'] |= SELL_EVENT
+    
+    # Set timestamps
+    event['exch_ts'] = timestamp
+    event['local_ts'] = timestamp + latency_ns
+    
+    # Set price and quantity
+    event['px'] = price
+    event['qty'] = qty
+    
+    return event
+
+# Create bid update
+bid_event = create_depth_update(
+    timestamp=1704067200_000_000_000,
+    price=50000.0,
+    qty=1.5,
+    is_bid=True,
+    latency_ns=100_000
+)
+```

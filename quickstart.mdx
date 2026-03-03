@@ -1,80 +1,526 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Run your first backtest with HftBacktest in minutes
 ---
 
-## Get started in three steps
+# Quick Start
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+Get up and running with HftBacktest by building a simple market-making strategy. This guide shows you how to create, configure, and run your first backtest.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Make sure you have [installed HftBacktest](/installation) before proceeding.
 </Note>
+
+## What You'll Build
+
+In this quickstart, you'll create a basic market-making algorithm that:
+- Places bid and ask orders around a reservation price
+- Manages order queue positions
+- Accounts for latency and order fills
+- Handles position limits and risk
+
+## Choose Your Language
+
+<Tabs>
+  <Tab title="Python">
+    ## Python Quick Start
+
+    ### Step 1: Import Dependencies
+
+    ```python
+    import numpy as np
+    from numba import njit
+    from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest, BUY, SELL, GTX, LIMIT
+    ```
+
+    <Note>
+    The `@njit` decorator from Numba compiles your strategy to machine code for high performance.
+    </Note>
+
+    ### Step 2: Define Your Strategy
+
+    Create a market-making algorithm using the `@njit` decorator:
+
+    ```python
+    @njit
+    def market_making_algo(hbt):
+        asset_no = 0
+        tick_size = hbt.depth(asset_no).tick_size
+        lot_size = hbt.depth(asset_no).lot_size
+
+        # Main strategy loop - elapse 10ms at a time
+        while hbt.elapse(10_000_000) == 0:  # nanoseconds
+            hbt.clear_inactive_orders(asset_no)
+
+            # Strategy parameters
+            a = 1  # Alpha weight
+            b = 1  # Risk aversion
+            c = 1  # Volatility weight
+            hs = 1  # Half spread multiplier
+
+            # Calculate alpha (forecast), volatility, and risk
+            forecast = 0  # Your alpha signal
+            volatility = 0  # Market volatility measure
+            position = hbt.position(asset_no)
+            risk = (c + volatility) * position
+            half_spread = (c + volatility) * hs
+
+            # Position limits
+            max_notional_position = 1000
+            notional_qty = 100
+
+            # Get market depth
+            depth = hbt.depth(asset_no)
+            mid_price = (depth.best_bid + depth.best_ask) / 2.0
+
+            # Calculate reservation price and quotes
+            reservation_price = mid_price + a * forecast - b * risk
+            new_bid = reservation_price - half_spread
+            new_ask = reservation_price + half_spread
+
+            # Convert to tick prices
+            new_bid_tick = min(np.round(new_bid / tick_size), depth.best_bid_tick)
+            new_ask_tick = max(np.round(new_ask / tick_size), depth.best_ask_tick)
+
+            # Calculate order quantity
+            order_qty = np.round(notional_qty / mid_price / lot_size) * lot_size
+
+            # Elapse processing time (1ms)
+            if hbt.elapse(1_000_000) != 0:
+                return False
+
+            # Manage existing orders
+            last_order_id = -1
+            update_bid = True
+            update_ask = True
+            buy_limit_exceeded = position * mid_price > max_notional_position
+            sell_limit_exceeded = position * mid_price < -max_notional_position
+
+            orders = hbt.orders(asset_no)
+            order_values = orders.values()
+            while order_values.has_next():
+                order = order_values.get()
+                if order.side == BUY:
+                    if order.price_tick == new_bid_tick or buy_limit_exceeded:
+                        update_bid = False
+                    if order.cancellable and (update_bid or buy_limit_exceeded):
+                        hbt.cancel(asset_no, order.order_id, False)
+                        last_order_id = order.order_id
+                elif order.side == SELL:
+                    if order.price_tick == new_ask_tick or sell_limit_exceeded:
+                        update_ask = False
+                    if order.cancellable and (update_ask or sell_limit_exceeded):
+                        hbt.cancel(asset_no, order.order_id, False)
+                        last_order_id = order.order_id
+
+            # Submit new orders
+            if update_bid and not buy_limit_exceeded:
+                order_id = new_bid_tick
+                hbt.submit_buy_order(
+                    asset_no, order_id, new_bid_tick * tick_size, 
+                    order_qty, GTX, LIMIT, False
+                )
+                last_order_id = order_id
+
+            if update_ask and not sell_limit_exceeded:
+                order_id = new_ask_tick
+                hbt.submit_sell_order(
+                    asset_no, order_id, new_ask_tick * tick_size,
+                    order_qty, GTX, LIMIT, False
+                )
+                last_order_id = order_id
+
+            # Wait for order response
+            if last_order_id >= 0:
+                timeout = 5_000_000_000  # 5 seconds
+                if not hbt.wait_order_response(asset_no, last_order_id, timeout):
+                    return False
+
+        return True
+    ```
+
+    ### Step 3: Configure the Backtest
+
+    Set up your backtest with market data and parameters:
+
+    ```python
+    if __name__ == '__main__':
+        # Configure the asset
+        asset = (
+            BacktestAsset()
+                .data([
+                    'data/btcusdt_20220831.npz',
+                    'data/btcusdt_20220901.npz',
+                ])
+                .initial_snapshot('data/btcusdt_20220830_eod.npz')
+                .linear_asset(1.0)
+                .intp_order_latency([
+                    'latency/live_order_latency_20220831.npz',
+                    'latency/live_order_latency_20220901.npz',
+                ])
+                .power_prob_queue_model(2.0)
+                .no_partial_fill_exchange()
+                .trading_value_fee_model(-0.00005, 0.0007)  # Maker/taker fees
+                .tick_size(0.1)
+                .lot_size(0.001)
+        )
+
+        # Create backtest and run
+        hbt = HashMapMarketDepthBacktest([asset])
+        market_making_algo(hbt)
+    ```
+
+    ### Step 4: Run the Backtest
+
+    ```bash
+    python your_strategy.py
+    ```
+
+    <Tip>
+    This example assumes market maker rebates (negative maker fees). Adjust the fee model based on your exchange's fee structure.
+    </Tip>
+
+  </Tab>
+
+  <Tab title="Rust">
+    ## Rust Quick Start
+
+    ### Step 1: Create a New Project
+
+    ```bash
+    cargo new my_backtest
+    cd my_backtest
+    ```
+
+    Add HftBacktest to your `Cargo.toml`:
+
+    ```toml
+    [dependencies]
+    hftbacktest = "0.9.4"
+    tracing = "0.1"
+    tracing-subscriber = "0.3"
+    ```
+
+    ### Step 2: Define Your Strategy
+
+    Create a grid trading strategy in `src/main.rs`:
+
+    ```rust
+    use hftbacktest::{
+        backtest::{
+            Backtest,
+            ExchangeKind,
+            L2AssetBuilder,
+            assettype::LinearAsset,
+            data::{DataSource, read_npz_file},
+            models::{
+                CommonFees,
+                IntpOrderLatency,
+                PowerProbQueueFunc3,
+                ProbQueueModel,
+                TradingValueFeeModel,
+            },
+            recorder::BacktestRecorder,
+        },
+        prelude::{ApplySnapshot, Bot, HashMapMarketDepth},
+    };
+
+    fn prepare_backtest() -> Backtest<HashMapMarketDepth> {
+        // Load latency data for multiple days
+        let latency_data = (20240501..20240532)
+            .map(|date| DataSource::File(format!("latency_{date}.npz")))
+            .collect();
+
+        let latency_model = IntpOrderLatency::new(latency_data, 0);
+        let asset_type = LinearAsset::new(1.0);
+        let queue_model = ProbQueueModel::new(PowerProbQueueFunc3::new(3.0));
+
+        // Load market data
+        let data = (20240501..20240532)
+            .map(|date| DataSource::File(format!("1000SHIBUSDT_{date}.npz")))
+            .collect();
+
+        // Build backtest configuration
+        let hbt = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::new()
+                    .data(data)
+                    .latency_model(latency_model)
+                    .asset_type(asset_type)
+                    .fee_model(TradingValueFeeModel::new(
+                        CommonFees::new(-0.00005, 0.0007)
+                    ))
+                    .exchange(ExchangeKind::NoPartialFillExchange)
+                    .queue_model(queue_model)
+                    .depth(|| {
+                        let mut depth = HashMapMarketDepth::new(0.000001, 1.0);
+                        depth.apply_snapshot(
+                            &read_npz_file("1000SHIBUSDT_20240501_SOD.npz", "data")
+                                .unwrap(),
+                        );
+                        depth
+                    })
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        hbt
+    }
+
+    fn main() {
+        tracing_subscriber::fmt::init();
+
+        // Strategy parameters
+        let relative_half_spread = 0.0005;
+        let relative_grid_interval = 0.0005;
+        let grid_num = 10;
+        let min_grid_step = 0.000001; // tick size
+        let skew = relative_half_spread / grid_num as f64;
+        let order_qty = 1.0;
+        let max_position = grid_num as f64 * order_qty;
+
+        // Run backtest
+        let mut hbt = prepare_backtest();
+        let mut recorder = BacktestRecorder::new(&hbt);
+
+        // Your strategy implementation would go here
+        // gridtrading(&mut hbt, &mut recorder, ...);
+
+        hbt.close().unwrap();
+        recorder.to_csv("gridtrading", ".").unwrap();
+    }
+    ```
+
+    ### Step 3: Build and Run
+
+    ```bash
+    cargo run --release
+    ```
+
+    <Warning>
+    Always use `--release` mode for actual backtesting. Debug builds can be 10-100x slower.
+    </Warning>
+
+  </Tab>
+</Tabs>
+
+## Understanding the Code
+
+### Key Components
+
+<Steps>
+  <Step title="Market Depth Access">
+    Get real-time market data including best bid/ask and order book:
+
+    ```python
+    depth = hbt.depth(asset_no)
+    mid_price = (depth.best_bid + depth.best_ask) / 2.0
+    ```
+  </Step>
+
+  <Step title="Position Management">
+    Track your current position and calculate risk:
+
+    ```python
+    position = hbt.position(asset_no)
+    risk = (c + volatility) * position
+    ```
+  </Step>
+
+  <Step title="Order Submission">
+    Submit limit orders with Good-Til-Crossing (GTX) time-in-force:
+
+    ```python
+    hbt.submit_buy_order(asset_no, order_id, price, qty, GTX, LIMIT, False)
+    ```
+  </Step>
+
+  <Step title="Latency Simulation">
+    Elapse time to simulate processing and network latency:
+
+    ```python
+    hbt.elapse(1_000_000)  # 1ms in nanoseconds
+    ```
+  </Step>
+</Steps>
+
+### Order Types and Time-in-Force
+
+| Order Type | Description |
+|------------|-------------|
+| `LIMIT` | Limit order at specified price |
+| `MARKET` | Market order (immediate execution) |
+
+| Time-in-Force | Description |
+|---------------|-------------|
+| `GTX` | Good-Til-Crossing (post-only, maker-only) |
+| `GTC` | Good-Til-Cancelled |
+| `FOK` | Fill-Or-Kill |
+| `IOC` | Immediate-Or-Cancel |
+
+## Configuration Options
+
+### Asset Configuration
+
+```python
+asset = (
+    BacktestAsset()
+        .data(['data.npz'])                    # Market data files
+        .initial_snapshot('snapshot.npz')       # Starting order book
+        .linear_asset(1.0)                      # Linear asset (futures)
+        .intp_order_latency(['latency.npz'])   # Order latency model
+        .power_prob_queue_model(2.0)           # Queue position model
+        .no_partial_fill_exchange()            # Exchange model
+        .trading_value_fee_model(-0.00005, 0.0007)  # Fees (maker, taker)
+        .tick_size(0.1)                        # Minimum price increment
+        .lot_size(0.001)                       # Minimum quantity increment
+)
+```
+
+### Fee Models
+
+<CodeGroup>
+```python Maker-Taker
+# Negative maker fee (rebate), positive taker fee
+.trading_value_fee_model(-0.00005, 0.0007)
+```
+
+```python Flat Fee
+# Same fee for maker and taker
+.trading_value_fee_model(0.0004, 0.0004)
+```
+
+```python No Fees
+# Zero fees for testing
+.trading_value_fee_model(0.0, 0.0)
+```
+</CodeGroup>
+
+### Queue Models
+
+The queue model determines order fill probability based on queue position:
+
+| Model | Parameter | Description |
+|-------|-----------|-------------|
+| `power_prob_queue_model` | `2.0` | Power law with exponent 2.0 (conservative) |
+| `power_prob_queue_model` | `3.0` | Power law with exponent 3.0 (moderate) |
+| `prob_queue_model` | Custom | Your custom probability function |
+
+<Tip>
+Higher exponents make it harder to get filled when you're back in the queue, simulating more competitive markets.
+</Tip>
+
+## Next Steps
+
+Now that you've run your first backtest, explore these topics:
+
+<CardGroup cols={2}>
+  <Card
+    title="Data Preparation"
+    icon="database"
+    href="/guides/data-preparation"
+  >
+    Learn how to prepare and format market data
+  </Card>
+  <Card
+    title="Market Depth & Trades"
+    icon="layer-group"
+    href="/guides/market-depth-trades"
+  >
+    Work with order book data and trade feeds
+  </Card>
+  <Card
+    title="Strategy Examples"
+    icon="book"
+    href="/examples/getting-started"
+  >
+    Explore trading strategies and examples
+  </Card>
+  <Card
+    title="API Reference"
+    icon="code"
+    href="/api/python/overview"
+  >
+    Dive deep into the complete API
+  </Card>
+</CardGroup>
+
+## Common Patterns
+
+### Time Management
+
+```python
+# Elapse time in strategy loop
+while hbt.elapse(10_000_000) == 0:  # 10ms intervals
+    # Strategy logic
+    pass
+
+# Elapse processing time
+hbt.elapse(1_000_000)  # 1ms processing delay
+```
+
+### Order Management
+
+```python
+# Clear filled/cancelled orders
+hbt.clear_inactive_orders(asset_no)
+
+# Cancel an order
+hbt.cancel(asset_no, order_id, wait=False)
+
+# Wait for order response
+hbt.wait_order_response(asset_no, order_id, timeout)
+```
+
+### Position Limits
+
+```python
+max_notional_position = 1000
+position = hbt.position(asset_no)
+
+buy_limit_exceeded = position * mid_price > max_notional_position
+sell_limit_exceeded = position * mid_price < -max_notional_position
+
+if not buy_limit_exceeded:
+    hbt.submit_buy_order(...)
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Strategy runs but no trades execute">
+    Check your order prices and queue model. Your orders may be too far from the market or getting stuck in queue. Try:
+    - Reducing spread
+    - Using more aggressive queue model
+    - Checking your order price logic
+  </Accordion>
+
+  <Accordion title="Numba compilation errors (Python)">
+    Ensure all variables are typed consistently within the `@njit` function. Numba requires static typing.
+  </Accordion>
+
+  <Accordion title="Data file not found errors">
+    Make sure your data files are in the correct location. Use absolute paths or paths relative to where you run the script:
+
+    ```python
+    import os
+    data_path = os.path.join(os.path.dirname(__file__), 'data', 'btcusdt.npz')
+    ```
+  </Accordion>
+
+  <Accordion title="Backtest runs too slowly">
+    - Python: Ensure `@njit` decorator is applied
+    - Rust: Build with `--release` flag
+    - Reduce data volume for initial testing
+    - Increase time intervals (e.g., 100ms instead of 10ms)
+  </Accordion>
+</AccordionGroup>
+
+## Example Data
+
+Looking for data to test with? Check out:
+
+- [Data preparation guide](/guides/data-preparation) - Convert exchange data
+- [Sample datasets](https://reach.stratosphere.capital/data/usdm/) - Free historical data
+- [Databento](https://databento.com/) - Professional market data feeds

@@ -1,0 +1,484 @@
+---
+title: Latency Modeling
+description: Feed and order latency modeling for realistic backtesting
+---
+
+## Overview
+
+Latency is critical in high-frequency trading. HftBacktest explicitly models both feed latency (time for market data to reach you) and order latency (time for orders to reach the exchange and responses to return). This ensures backtest results closely match live trading performance.
+
+## Latency Components
+
+HftBacktest tracks two independent latency types:
+
+<CardGroup cols={2}>
+  <Card title="Feed Latency" icon="signal">
+    Time for market data to travel from the exchange to your system:
+    ```
+    exch_ts → [ network + processing ] → local_ts
+    ```
+    Affects when you see market events and can react.
+  </Card>
+  
+  <Card title="Order Latency" icon="right-left">
+    Round-trip time for order submission and response:
+    ```
+    req_ts → [ entry ] → exch_ts → [ response ] → resp_ts
+    ```
+    Affects how quickly you can enter and exit positions.
+  </Card>
+</CardGroup>
+
+## The LatencyModel Trait
+
+Order latency is modeled through the `LatencyModel` trait from `backtest/models/latency.rs:14-20`:
+
+```rust
+pub trait LatencyModel {
+    /// Returns the order entry latency
+    fn entry(&mut self, timestamp: i64, order: &Order) -> i64;
+    
+    /// Returns the order response latency
+    fn response(&mut self, timestamp: i64, order: &Order) -> i64;
+}
+```
+
+These methods return latencies in the same time unit as your data (typically nanoseconds).
+
+## Feed Latency
+
+### How It Works
+
+Feed latency is embedded in the data itself through two timestamps:
+
+- **exch_ts**: When the event occurred at the exchange
+- **local_ts**: When the event was received locally
+
+The difference `local_ts - exch_ts` is the feed latency:
+
+```python
+# Access feed latency for the last event
+exch_ts, local_ts = hbt.feed_latency(asset_no)
+feed_latency = local_ts - exch_ts  # in nanoseconds
+```
+
+### Local Processor View
+
+The local processor (your strategy) sees events at `local_ts`:
+
+```rust
+// From backtest/proc/mod.rs
+fn event_seen_timestamp(&self, event: &Event) -> Option<i64> {
+    if event.is(LOCAL_EVENT) {
+        Some(event.local_ts)  // Local sees at local_ts
+    } else {
+        None
+    }
+}
+```
+
+This means your strategy reacts to market events with realistic delay.
+
+### Latency Offset
+
+Adjust feed latency for different deployment locations:
+
+```rust
+asset.latency_offset(-5_000_000)  // Reduce latency by 5ms
+```
+
+Useful when:
+- Backtesting with data collected from Location A but deploying at Location B
+- Testing sensitivity to colocation improvements
+- Accounting for hardware/software optimizations
+
+## Order Latency
+
+### Entry and Response
+
+Order latency has two components:
+
+<Tabs>
+  <Tab title="Entry Latency">
+    Time from order submission to exchange receipt:
+    
+    ```
+    [Local] Submit order at req_ts
+         ↓ [ network + processing ]
+    [Exchange] Receive at exch_ts = req_ts + entry_latency
+    ```
+    
+    Typical values: 100µs (colocation) to 50ms (distant)
+  </Tab>
+  
+  <Tab title="Response Latency">
+    Time from exchange processing to response receipt:
+    
+    ```
+    [Exchange] Process order at exch_ts
+         ↓ [ network + processing ]
+    [Local] Receive response at resp_ts = exch_ts + response_latency
+    ```
+    
+    Often similar to entry latency, but can differ due to exchange processing load.
+  </Tab>
+</Tabs>
+
+Total round-trip latency = `entry_latency + response_latency`
+
+### Latency Timeline
+
+Here's the complete timeline of an order:
+
+```
+t=0    : Strategy submits order (req_ts)
+t=1ms  : Exchange receives order (exch_ts = req_ts + entry_latency)
+t=1ms  : Exchange matches order
+t=2ms  : Strategy receives fill (resp_ts = exch_ts + response_latency)
+```
+
+Access this information:
+
+```python
+req_ts, exch_ts, resp_ts = hbt.order_latency(asset_no)
+entry_lat = exch_ts - req_ts
+response_lat = resp_ts - exch_ts
+round_trip = resp_ts - req_ts
+```
+
+## Latency Models
+
+### Constant Latency
+
+Simplest model with fixed latencies:
+
+```python
+from hftbacktest import ConstantLatency
+
+# 100µs entry, 100µs response (typical colocation)
+latency_model = ConstantLatency(entry_latency=100_000, 
+                                 response_latency=100_000)
+
+asset = (
+    BacktestAsset()
+        .constant_latency(entry_latency=100_000,
+                         response_latency=100_000)
+        # ... other config
+)
+```
+
+<Note>
+  Latencies should be in nanoseconds to match event timestamps. 1ms = 1,000,000 nanoseconds.
+</Note>
+
+From `latency.rs:23-55`, constant latency simply returns the configured values.
+
+### Interpolated Latency
+
+Use actual historical order latency data for the most accurate simulation:
+
+```python
+from hftbacktest import IntpOrderLatency
+
+# Load latency data files
+latency_model = IntpOrderLatency(
+    files=[
+        'latency/order_latency_20220831.npz',
+        'latency/order_latency_20220901.npz',
+    ],
+    latency_offset=0
+)
+
+asset = (
+    BacktestAsset()
+        .intp_order_latency([
+            'latency/order_latency_20220831.npz',
+            'latency/order_latency_20220901.npz',
+        ])
+        # ... other config
+)
+```
+
+#### Latency Data Format
+
+The latency file should be a NumPy `.npz` containing `OrderLatencyRow` structs from `latency.rs:58-69`:
+
+```python
+import numpy as np
+
+# OrderLatencyRow structure
+latency_dtype = np.dtype([
+    ('req_ts', 'i8'),    # Request timestamp
+    ('exch_ts', 'i8'),   # Exchange timestamp  
+    ('resp_ts', 'i8'),   # Response timestamp
+    ('_padding', 'i8'),  # For alignment
+])
+
+latency_data = np.array([
+    (0, 150_000, 300_000, 0),      # 150µs entry, 150µs response
+    (10_000_000, 200_000, 450_000, 0),  # 200µs entry, 250µs response
+    # ... more samples
+], dtype=latency_dtype)
+
+np.savez('order_latency.npz', data=latency_data)
+```
+
+#### Interpolation
+
+The model interpolates between historical samples based on the current timestamp (from `latency.rs:170-273`):
+
+```rust
+fn intp(&self, x: i64, x1: i64, y1: i64, x2: i64, y2: i64) -> i64 {
+    (((y2 - y1) as f64) / ((x2 - x1) as f64) * ((x - x1) as f64)) as i64 + y1
+}
+```
+
+For timestamp `t`, if `t1 <= t < t2`:
+- Entry latency = interpolate between (t1, entry1) and (t2, entry2)
+- Response latency = interpolate between (t1, resp1) and (t2, resp2)
+
+### Order Rejection
+
+<Warning>
+  When `exch_ts <= 0` in latency data, it indicates the exchange rejected the order due to technical issues. The model returns **negative latency** as a rejection signal.
+</Warning>
+
+From `latency.rs:195-214`, when seeing zero exchange timestamps:
+
+```rust
+if exch_timestamp <= 0 || next_exch_timestamp <= 0 {
+    // Negative latency = rejection
+    return -self.intp(
+        timestamp,
+        req_local_timestamp,
+        lat1,
+        next_req_local_timestamp,
+        lat2,
+    );
+}
+```
+
+The processor interprets negative latency as rejection and marks the order accordingly.
+
+## Latency in Practice
+
+### Measuring Latency Impact
+
+Compare performance across different latency scenarios:
+
+<CodeGroup>
+```python Colocation (Low Latency)
+asset_colo = (
+    BacktestAsset()
+        .constant_latency(100_000, 100_000)  # 100µs each way
+        # ... other config
+)
+```
+
+```python Retail (High Latency)
+asset_retail = (
+    BacktestAsset()
+        .constant_latency(10_000_000, 10_000_000)  # 10ms each way
+        # ... other config
+)
+```
+
+```python Compare Results
+# Run same strategy with both
+hbt_colo = HashMapMarketDepthBacktest([asset_colo])
+strategy(hbt_colo)
+colo_pnl = hbt_colo.state_values(0).balance
+
+hbt_retail = HashMapMarketDepthBacktest([asset_retail])
+strategy(hbt_retail)
+retail_pnl = hbt_retail.state_values(0).balance
+
+latency_impact = colo_pnl - retail_pnl
+```
+</CodeGroup>
+
+See the [Impact of Order Latency](https://hftbacktest.readthedocs.io/en/latest/tutorials/Impact%20of%20Order%20Latency.html) tutorial for detailed analysis.
+
+### Race Conditions
+
+Latency affects race conditions in adversarial selection:
+
+```python
+@njit
+def check_race_condition(hbt):
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    
+    # Market is at 100.0/100.1
+    # We want to buy at 100.0
+    
+    # Submit order
+    req_ts = hbt.current_timestamp()
+    hbt.submit_buy_order(asset_no, order_id, 100.0, 1.0, GTX, LIMIT, False)
+    
+    # With 1ms latency, order arrives at exch_ts = req_ts + 1_000_000
+    # If market moves to 99.9/100.0 before exch_ts, we miss the fill
+    # If market moves to 100.0/100.1, we get filled instantly (adverse selection)
+```
+
+Proper latency modeling reveals these dynamics.
+
+### Order Latency Data Collection
+
+If you have live trading logs, extract latency data:
+
+```python
+import numpy as np
+import pandas as pd
+
+# Load order logs
+orders = pd.read_csv('order_log.csv')
+
+# Create latency data
+latency_data = np.array([
+    (
+        row.req_timestamp,
+        row.exch_timestamp,
+        row.resp_timestamp,
+        0  # padding
+    )
+    for _, row in orders.iterrows()
+], dtype=latency_dtype)
+
+np.savez('historical_latency.npz', data=latency_data)
+```
+
+See [Order Latency Data](https://hftbacktest.readthedocs.io/en/latest/tutorials/Order%20Latency%20Data.html) tutorial.
+
+## Event Processing with Latency
+
+The event processing flow accounts for latency at each step (from `backtest/mod.rs:755-863`):
+
+<Steps>
+  <Step title="Local Data Event">
+    Process market feed at `local_ts`:
+    ```rust
+    EventIntentKind::LocalData => {
+        local.process(&data[row])?;  // Strategy sees event
+    }
+    ```
+  </Step>
+  
+  <Step title="Local Order Submit">
+    Strategy submits order at current timestamp:
+    ```rust
+    local.submit_order(order_id, side, price, qty, order_type, time_in_force, cur_ts)?;
+    ```
+  </Step>
+  
+  <Step title="Exchange Order Receipt">
+    Exchange receives order at `exch_ts = req_ts + entry_latency`:
+    ```rust
+    EventIntentKind::ExchOrder => {
+        exch.process_recv_order(timestamp, None)?;
+    }
+    ```
+  </Step>
+  
+  <Step title="Exchange Processing">
+    Exchange processes order at `exch_ts` against the order book:
+    ```rust
+    EventIntentKind::ExchData => {
+        exch.process(&data[row])?;  // Matching engine
+    }
+    ```
+  </Step>
+  
+  <Step title="Local Order Response">
+    Strategy receives response at `resp_ts = exch_ts + response_latency`:
+    ```rust
+    EventIntentKind::LocalOrder => {
+        local.process_recv_order(timestamp, wait_order_id)?;
+    }
+    ```
+  </Step>
+</Steps>
+
+## Latency Recommendations
+
+<Tabs>
+  <Tab title="For Accurate Backtesting">
+    Use interpolated latency with historical data:
+    
+    ✅ Most accurate simulation
+    ✅ Captures time-of-day variations
+    ✅ Reflects actual network conditions
+    ✅ Includes exchange processing variability
+    
+    Collect latency data during live trading or paper trading.
+  </Tab>
+  
+  <Tab title="For Conservative Estimates">
+    Use constant latency with 95th percentile values:
+    
+    ```python
+    # If typical latency is 1ms, use 2ms for safety
+    .constant_latency(2_000_000, 2_000_000)
+    ```
+    
+    ✅ Simple to configure
+    ✅ Conservative (underestimates profitability)
+    ✅ No data collection needed
+  </Tab>
+  
+  <Tab title="For Sensitivity Analysis">
+    Run multiple backtests with different latencies:
+    
+    ```python
+    latencies = [100_000, 500_000, 1_000_000, 5_000_000]  # 0.1ms to 5ms
+    results = []
+    
+    for lat in latencies:
+        asset = BacktestAsset().constant_latency(lat, lat)
+        hbt = HashMapMarketDepthBacktest([asset])
+        strategy(hbt)
+        results.append(hbt.state_values(0).balance)
+    
+    # Plot profitability vs latency
+    ```
+    
+    ✅ Understand latency sensitivity
+    ✅ Guide infrastructure investment decisions
+  </Tab>
+</Tabs>
+
+## Cross-Exchange Latency
+
+For multi-exchange strategies, each asset can have different latency:
+
+```python
+asset_binance = (
+    BacktestAsset()
+        .data(['binance_data.npz'])
+        .constant_latency(500_000, 500_000)  # 0.5ms
+)
+
+asset_bybit = (
+    BacktestAsset()
+        .data(['bybit_data.npz'])
+        .constant_latency(1_000_000, 1_000_000)  # 1ms
+)
+
+hbt = HashMapMarketDepthBacktest([asset_binance, asset_bybit])
+```
+
+Critical for arbitrage strategies where speed advantage matters.
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Backtesting" icon="clock" href="/concepts/backtesting">
+    How latency affects event-driven backtesting
+  </Card>
+  <Card title="Queue Position" icon="list-ol" href="/concepts/queue-position">
+    Queue position depends on order arrival time
+  </Card>
+  <Card title="Order Latency Tutorial" icon="book" href="https://hftbacktest.readthedocs.io/en/latest/tutorials/Impact%20of%20Order%20Latency.html">
+    Measuring latency impact on profitability
+  </Card>
+</CardGroup>

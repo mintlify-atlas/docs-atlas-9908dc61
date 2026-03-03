@@ -1,0 +1,314 @@
+---
+title: 'Level-3 Market-By-Order Backtesting'
+description: 'Learn how to perform high-fidelity backtesting with Level-3 Market-By-Order data'
+---
+
+## Overview
+
+Level-3 Market-By-Order (MBO) data represents the highest fidelity market data available, containing every individual order in the book with unique order IDs. This enables the most accurate order fill simulation possible, as you can track the exact position of your orders in the queue and see when orders ahead of you are canceled or filled.
+
+<Note>
+Level-3 backtesting is primarily available for CME futures markets through DataBento's MBO feed. The complexity and data volume of Level-3 feeds means they are not commonly available for cryptocurrency exchanges.
+</Note>
+
+## Level-3 vs Level-2 Data
+
+| Feature | Level-2 (Market-By-Price) | Level-3 (Market-By-Order) |
+|---------|---------------------------|---------------------------|
+| **Granularity** | Aggregated quantity at each price | Individual orders with unique IDs |
+| **Queue Position** | Estimated probabilistically | Tracked precisely via FIFO |
+| **Order Cancellations** | Only see net quantity change | See exact cancellations ahead of you |
+| **Fill Accuracy** | Approximate based on models | Exact based on queue position |
+| **Data Volume** | Moderate | Very high |
+| **Complexity** | Lower | Higher |
+
+## Data Preparation
+
+### Converting DataBento MBO Data
+
+HftBacktest provides built-in support for converting DataBento's CME Market-By-Order data:
+
+```python
+from hftbacktest.data.utils import databento
+
+# Convert DataBento MBO files to HftBacktest format
+for date in range(20240609, 20240615):
+    databento.convert(
+        f'data/db/glbx-mdp3-{date}.mbo.dbn.zst',
+        'BTCM4',  # Symbol to extract
+        output_filename=f'data/BTCM4_{date}_l3.npz'
+    )
+```
+
+<Info>
+The conversion process includes:
+- **Latency correction**: Aligns exchange and local timestamps
+- **Event ordering**: Ensures proper chronological order
+- **Compression**: Outputs space-efficient NPZ format
+</Info>
+
+## Configuring Level-3 Backtesting
+
+### Basic Setup
+
+```python
+from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest, Recorder
+
+asset = (
+    BacktestAsset()
+        .data([
+            'data/BTCM4_20240609_l3.npz',
+            'data/BTCM4_20240610_l3.npz',
+            'data/BTCM4_20240611_l3.npz',
+        ])
+        .linear_asset(5)  # Contract multiplier
+        .constant_latency(100_000, 100_000)  # 100μs entry and response latency
+        .l3_fifo_queue_model()  # Use Level-3 FIFO queue model
+        .no_partial_fill_exchange()  # CME typically doesn't do partial fills
+        .trading_qty_fee_model(5, 5)  # Fee per contract
+        .tick_size(5)  # CME BTC tick size
+        .lot_size(1)  # Contract size
+        .roi_lb(0.0)    
+        .roi_ub(100000.0)
+)
+
+hbt = ROIVectorMarketDepthBacktest([asset])
+recorder = Recorder(1, 50_000_000)
+```
+
+### Key Configuration Points
+
+<CodeGroup>
+
+```python Level-3 Queue Model
+# FIFO queue model for Level-3 data
+asset.l3_fifo_queue_model()
+
+# Your position in queue is tracked exactly based on:
+# - Order arrival time
+# - Cancellations ahead of you
+# - Fills ahead of you
+```
+
+```python Exchange Model
+# No partial fill exchange (typical for CME)
+asset.no_partial_fill_exchange()
+
+# Orders are either:
+# - Fully filled when at front of queue and trade occurs
+# - Not filled at all
+```
+
+```python Fee Structure
+# Trading quantity-based fees (per contract)
+asset.trading_qty_fee_model(maker_fee, taker_fee)
+
+# For CME, fees are typically per contract
+# Example: $5 per contract
+```
+
+</CodeGroup>
+
+## Example Strategy
+
+Here's a grid trading strategy optimized for Level-3 backtesting:
+
+```python
+from numba import njit, uint64
+from numba.typed import Dict
+from hftbacktest import BUY, SELL, GTC, LIMIT
+
+@njit
+def gridtrading_l3(hbt, recorder, skew):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    grid_num = 10
+    max_position = 5
+    grid_interval = tick_size * 1
+    half_spread = tick_size * 0.4
+
+    while hbt.elapse(100_000_000) == 0:  # Check every 100ms
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+        
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        order_qty = 1  # 1 contract per order
+        
+        # Skew prices based on inventory
+        reservation_price = mid_price - skew * tick_size * position
+        bid_price = np.minimum(reservation_price - half_spread, best_bid)
+        ask_price = np.maximum(reservation_price + half_spread, best_ask)
+        
+        # Align to grid
+        bid_price = np.floor(bid_price / grid_interval) * grid_interval
+        ask_price = np.ceil(ask_price / grid_interval) * grid_interval
+        
+        # Update quotes (canceling old, submitting new)
+        new_bid_orders = Dict.empty(np.uint64, np.float64)
+        if position < max_position and np.isfinite(bid_price):
+            for i in range(grid_num):
+                bid_price_tick = round(bid_price / tick_size)
+                new_bid_orders[uint64(bid_price_tick)] = bid_price
+                bid_price -= grid_interval
+        
+        new_ask_orders = Dict.empty(np.uint64, np.float64)
+        if position > -max_position and np.isfinite(ask_price):
+            for i in range(grid_num):
+                ask_price_tick = round(ask_price / tick_size)
+                new_ask_orders[uint64(ask_price_tick)] = ask_price
+                ask_price += grid_interval
+        
+        # Cancel orders not in new grid
+        order_values = orders.values()
+        while order_values.has_next():
+            order = order_values.get()
+            if order.cancellable:
+                if ((order.side == BUY and order.order_id not in new_bid_orders) or
+                    (order.side == SELL and order.order_id not in new_ask_orders)):
+                    hbt.cancel(asset_no, order.order_id, False)
+        
+        # Submit new orders
+        for order_id, order_price in new_bid_orders.items():
+            if order_id not in orders:
+                hbt.submit_buy_order(asset_no, order_id, order_price, 
+                                     order_qty, GTC, LIMIT, False)
+        
+        for order_id, order_price in new_ask_orders.items():
+            if order_id not in orders:
+                hbt.submit_sell_order(asset_no, order_id, order_price, 
+                                      order_qty, GTC, LIMIT, False)
+        
+        recorder.record(hbt)
+    
+    return True
+```
+
+## Level-3 Queue Position Tracking
+
+With Level-3 data, queue position is tracked with perfect accuracy:
+
+### How FIFO Queue Works
+
+1. **Order Submission**: When your order joins the queue, your position equals the current quantity at that price level
+
+2. **Order Ahead Filled**: When a trade occurs, all orders at the front are filled before yours
+
+3. **Order Ahead Canceled**: When an order ahead of you cancels, your position improves immediately
+
+4. **Your Turn**: You get filled when:
+   - You're at the front of the queue AND
+   - A trade occurs at your price level OR
+   - The market crosses your price
+
+```python
+# Example: Queue position tracking
+# Price level 69000 has orders:
+# Order A: 5 contracts (front)
+# Order B: 3 contracts
+# Your Order: 2 contracts
+# Order D: 4 contracts (back)
+
+# Initial queue position: 8 contracts ahead
+queue_position = 5 + 3  # Orders A + B
+
+# If Order A cancels:
+queue_position = 3  # Only Order B ahead now
+
+# If trade occurs for 2 contracts:
+queue_position = 1  # 3 - 2 from Order B
+
+# If another trade for 1+ contracts:
+queue_position = 0  # Your order fills!
+```
+
+## Performance Considerations
+
+Level-3 backtesting is significantly more resource-intensive:
+
+<Warning>
+**Resource Requirements**:
+- Memory: 2-4x more than Level-2 data
+- Processing time: 3-5x slower than Level-2
+- Storage: 5-10x larger data files
+</Warning>
+
+### Optimization Tips
+
+```python
+# 1. Use ROI (Region of Interest) to limit depth processing
+asset.roi_lb(0.0).roi_ub(100000.0)  # Only track relevant price range
+
+# 2. Limit backtest period for initial testing
+asset.data(['data/BTCM4_20240609_l3.npz'])  # Start with single day
+
+# 3. Increase running interval if sub-millisecond precision not needed
+while hbt.elapse(100_000_000) == 0:  # 100ms vs 1ms intervals
+```
+
+## Validation
+
+Level-3 backtesting provides the highest confidence in results:
+
+```python
+from hftbacktest.stats import LinearAssetRecord
+
+# Run backtest
+gridtrading_l3(hbt, recorder, skew=0.5)
+
+# Analyze results
+record = LinearAssetRecord(recorder.get_records(0))
+
+print(f"Total Trades: {record.num_trades}")
+print(f"Sharpe Ratio: {record.sharpe_ratio}")
+print(f"Max Drawdown: {record.max_drawdown}")
+print(f"Win Rate: {record.num_trades_won / record.num_trades:.2%}")
+```
+
+<Check>
+**When Level-3 backtesting closely matches live trading results, you can have high confidence that:**
+- Queue position estimation is accurate
+- Latency modeling is correct
+- Fill simulation is realistic
+- The strategy will perform as expected
+</Check>
+
+## Comparison with Level-2
+
+After validating with Level-3, you may find Level-2 with proper queue models is sufficient:
+
+```python
+# Level-3: Perfect accuracy
+asset.l3_fifo_queue_model()
+
+# Level-2: Probabilistic estimation (faster, still accurate)
+asset.power_prob_queue_model(3.0)
+```
+
+Use Level-3 for:
+- Initial strategy validation
+- Understanding true market dynamics
+- High-stakes production strategies
+- Markets with large tick sizes
+
+Use Level-2 for:
+- Rapid iteration and development
+- Parameter optimization
+- Markets with small tick sizes
+- When speed matters more than perfection
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Queue Models" icon="layer-group" href="/advanced/queue-models">
+    Learn about probabilistic queue models for Level-2 data
+  </Card>
+  <Card title="Latency Modeling" icon="clock" href="/advanced/latency-modeling">
+    Model realistic order latencies
+  </Card>
+</CardGroup>

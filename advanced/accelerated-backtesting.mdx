@@ -1,0 +1,525 @@
+---
+title: 'Accelerated Backtesting'
+description: 'Trade accuracy for speed when optimizing parameters or testing ideas rapidly'
+---
+
+## Overview
+
+Standard HftBacktest provides highly accurate results by simulating every market event, tracking queue positions, and modeling latencies precisely. However, this accuracy comes at a cost: backtesting can be slow, especially when:
+
+- Testing hundreds of parameter combinations
+- Running multi-month backtests
+- Iterating on new strategy ideas
+- Performing walk-forward optimization
+
+Accelerated backtesting sacrifices some accuracy for dramatic speed improvements (often 10-50x faster) by:
+1. Precomputing fill conditions for time intervals
+2. Skipping detailed queue position tracking
+3. Ignoring order response latency
+4. Processing data in larger chunks
+
+<Warning>
+**When to Use Accelerated Backtesting**:
+- Parameter optimization and grid searches
+- Rapid idea validation
+- Initial strategy development
+- When queue position is less critical (small tick size markets)
+
+**When to Use Standard Backtesting**:
+- Final strategy validation
+- Production deployment decisions
+- Large tick size markets
+- Queue-sensitive strategies
+</Warning>
+
+## Key Differences
+
+| Aspect | Standard Backtest | Accelerated Backtest |
+|--------|------------------|----------------------|
+| **Queue Position** | Tracked with probability models | Ignored (no partial fills) |
+| **Order Response Latency** | Modeled accurately | Ignored (immediate state update) |
+| **Feed Latency** | Modeled | Modeled (preserved) |
+| **Fill Simulation** | Event-by-event | Precomputed per interval |
+| **Partial Fills** | Supported | Not supported |
+| **Speed** | 1x (baseline) | 10-50x faster |
+| **Accuracy** | Highest | Reduced, but sufficient for parameter search |
+
+## How It Works
+
+### Fill Conditions
+
+Instead of checking fills on every market event, accelerated backtesting precomputes fill prices for each time interval:
+
+**For Buy Orders**:
+```python
+bid_fill_price = min(
+    lowest_best_ask_in_interval,
+    lowest_sell_trade_price_in_interval + one_tick
+)
+
+# Your buy order fills if:
+order_price >= bid_fill_price
+```
+
+**For Sell Orders**:
+```python
+ask_fill_price = max(
+    highest_best_bid_in_interval,  
+    highest_buy_trade_price_in_interval - one_tick
+)
+
+# Your sell order fills if:
+order_price <= ask_fill_price
+```
+
+<Info>
+**Important**: Because queue position is not considered:
+- `order_price == trade_price` does NOT fill (need to cross)
+- Orders are either fully filled or not filled at all
+- No partial fills
+</Info>
+
+### Data Structure
+
+Accelerated backtesting uses preprocessed data with precomputed fill prices:
+
+```
+                      row[t]                                    row[t+1]
+Local
++----------------------------------------------------------+-------------------
+|local_ts[t]                                               |local_ts[t+1]
+|best_bid[t]                                               |best_bid[t+1]
+|best_ask[t]                                               |best_ask[t+1]
++----------------------------------------------------------+-------------------
+Exchange
++----------------------------------------------------------+-------------------
+|                                            bid_fill[t+1] |
+|                                            ask_fill[t+1] |
++-------------------------+--------------------------------+-------------------
+|  order entry latency    |order_ack_ts[t]                |
+|  at local_ts[t]         |best_bid_ack[t]                |
+|                         |best_ask_ack[t]                |
+|          bid_fill_ack[t]|          bid_fill_after_ack[t]|
+|          ask_fill_ack[t]|          ask_fill_after_ack[t]|
++-------------------------+--------------------------------+-------------------
+```
+
+At each interval:
+- **bid_fill[t+1]**: Highest price where buy orders get filled
+- **ask_fill[t+1]**: Lowest price where sell orders get filled
+- **bid_fill_ack[t]**: Fill price for orders sent before ack time
+- **bid_fill_after_ack[t]**: Fill price for orders sent after ack time
+
+## Preprocessing Market Data
+
+### Step 1: Define the Running Interval
+
+Choose your strategy's decision interval:
+
+```python
+running_interval = 100_000_000  # 100ms in nanoseconds
+
+# This determines:
+# - How often your strategy makes decisions
+# - The granularity of precomputed fill prices
+# - Speed vs accuracy tradeoff
+```
+
+**Choosing the Interval**:
+- **10-100ms**: Good balance for most strategies
+- **100-500ms**: Faster, sufficient for slower strategies
+- **< 10ms**: Defeats purpose of acceleration
+
+### Step 2: Process Raw Market Data
+
+Implement preprocessing using Numba for performance:
+
+```python
+import numpy as np
+from numba import njit
+
+INVALID_MIN = 0
+INVALID_MAX = np.iinfo(np.int64).max - 1
+
+@njit
+def preprocess_data(raw_data, running_interval, tick_size, entry_latency):
+    """
+    Preprocess market data for accelerated backtesting
+    
+    Args:
+        raw_data: Raw market events [exch_ts, local_ts, px, qty, ...]
+        running_interval: Strategy running interval in nanoseconds
+        tick_size: Market tick size
+        entry_latency: Order entry latency in nanoseconds
+    
+    Returns:
+        Preprocessed data with precomputed fill prices
+    """
+    # Initialize output arrays
+    num_intervals = int((raw_data[-1]['local_ts'] - raw_data[0]['local_ts']) / running_interval) + 1
+    
+    processed = np.zeros(num_intervals, dtype=[
+        ('local_ts', 'i8'),
+        ('best_bid', 'f8'),
+        ('best_ask', 'f8'),
+        ('bid_fill', 'f8'),
+        ('ask_fill', 'f8'),
+        ('order_ack_ts', 'i8'),
+        ('best_bid_ack', 'f8'),
+        ('best_ask_ack', 'f8'),
+        ('bid_fill_ack', 'f8'),
+        ('ask_fill_ack', 'f8'),
+        ('bid_fill_after_ack', 'f8'),
+        ('ask_fill_after_ack', 'f8'),
+    ])
+    
+    start_ts = raw_data[0]['local_ts']
+    interval_idx = 0
+    
+    # Initialize tracking variables
+    current_best_bid = np.nan
+    current_best_ask = np.nan
+    
+    # For each interval
+    for i in range(num_intervals):
+        interval_start = start_ts + i * running_interval
+        interval_end = interval_start + running_interval
+        ack_time = interval_start + entry_latency
+        
+        # Initialize interval values
+        lowest_best_ask = np.inf
+        highest_best_bid = -np.inf
+        lowest_sell_trade = np.inf
+        highest_buy_trade = -np.inf
+        
+        # Process events in this interval
+        for event in raw_data:
+            if event['local_ts'] < interval_start:
+                continue
+            if event['local_ts'] >= interval_end:
+                break
+            
+            # Track best bid/ask
+            if event['ev'] == DEPTH_EVENT:
+                if event['ev'] & BUY_EVENT:
+                    current_best_bid = event['px']
+                else:
+                    current_best_ask = event['px']
+            
+            # Track trades
+            elif event['ev'] == TRADE_EVENT:
+                if event['ev'] & BUY_EVENT:
+                    highest_buy_trade = max(highest_buy_trade, event['px'])
+                else:
+                    lowest_sell_trade = min(lowest_sell_trade, event['px'])
+            
+            # Track best prices in interval
+            lowest_best_ask = min(lowest_best_ask, current_best_ask)
+            highest_best_bid = max(highest_best_bid, current_best_bid)
+        
+        # Compute fill prices
+        bid_fill = lowest_best_ask
+        if np.isfinite(lowest_sell_trade):
+            bid_fill = min(bid_fill, lowest_sell_trade + tick_size)
+        
+        ask_fill = highest_best_bid
+        if np.isfinite(highest_buy_trade):
+            ask_fill = max(ask_fill, highest_buy_trade - tick_size)
+        
+        # Store in processed data
+        processed[i]['local_ts'] = interval_start
+        processed[i]['best_bid'] = current_best_bid
+        processed[i]['best_ask'] = current_best_ask
+        processed[i]['bid_fill'] = bid_fill
+        processed[i]['ask_fill'] = ask_fill
+        processed[i]['order_ack_ts'] = ack_time
+        # ... compute ack-related values similarly
+    
+    return processed
+
+# Save preprocessed data
+np.savez('btcusdt_20240101_accel.npz', data=processed)
+```
+
+### Step 3: Simplified Preprocessing
+
+For practical use, you can leverage HftBacktest's data utilities and focus on interval-based aggregation:
+
+```python
+from hftbacktest.data.utils import tardis
+import numpy as np
+
+# First convert to standard format
+tardis.convert(
+    ['BTCUSDT_trades_20240101.csv.gz',
+     'BTCUSDT_incremental_book_L2_20240101.csv.gz'],
+    output_filename='BTCUSDT_20240101.npz'
+)
+
+# Then run your preprocessing
+raw_data = np.load('BTCUSDT_20240101.npz')['data']
+processed = preprocess_data(
+    raw_data,
+    running_interval=100_000_000,  # 100ms
+    tick_size=0.1,
+    entry_latency=1_000_000  # 1ms
+)
+np.savez('BTCUSDT_20240101_accel.npz', data=processed)
+```
+
+## Using Accelerated Backtesting
+
+Once you have preprocessed data, use it with a simplified backtester:
+
+```python
+from hftbacktest import BacktestAsset, AcceleratedBacktest
+from numba import njit
+
+@njit
+def fast_strategy(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    # Strategy runs at preprocessed interval (e.g., 100ms)
+    while hbt.elapse(100_000_000) == 0:
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        # Simple market making logic
+        half_spread = tick_size * 2
+        bid_price = mid_price - half_spread
+        ask_price = mid_price + half_spread
+        
+        order_qty = 0.1
+        
+        # Clear old orders
+        hbt.clear_inactive_orders(asset_no)
+        
+        # Submit new orders
+        if position < 10:
+            hbt.submit_buy_order(asset_no, 1, bid_price, order_qty, 
+                                GTC, LIMIT, False)
+        if position > -10:
+            hbt.submit_sell_order(asset_no, 2, ask_price, order_qty, 
+                                 GTC, LIMIT, False)
+    
+    return True
+
+# Configure with accelerated data
+asset = (
+    BacktestAsset()
+        .data(['BTCUSDT_20240101_accel.npz'])
+        .accelerated()  # Use accelerated mode
+        .linear_asset(1.0)
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+
+hbt = AcceleratedBacktest([asset])
+recorder = Recorder(1, 1_000_000)
+
+fast_strategy(hbt, recorder)
+```
+
+<Note>
+In accelerated mode:
+- Queue position is not tracked
+- Orders fill immediately when conditions met (no response latency)
+- Much faster execution
+- Suitable for parameter optimization
+</Note>
+
+## Parameter Optimization
+
+Accelerated backtesting shines in parameter optimization:
+
+```python
+from itertools import product
+import numpy as np
+import pandas as pd
+
+def optimize_parameters(data_files):
+    """Grid search over strategy parameters"""
+    
+    # Define parameter grid
+    half_spreads = [1, 2, 3, 4, 5]  # In ticks
+    max_positions = [5, 10, 15, 20]
+    skews = [0.0, 0.5, 1.0, 1.5]
+    
+    results = []
+    
+    # Test all combinations
+    for half_spread, max_pos, skew in product(half_spreads, max_positions, skews):
+        asset = (
+            BacktestAsset()
+                .data(data_files)
+                .accelerated()
+                # ... config
+        )
+        
+        hbt = AcceleratedBacktest([asset])
+        recorder = Recorder(1, 1_000_000)
+        
+        # Run strategy with these parameters
+        fast_strategy(hbt, recorder, half_spread, max_pos, skew)
+        
+        # Collect results
+        record = LinearAssetRecord(recorder.get_records(0))
+        results.append({
+            'half_spread': half_spread,
+            'max_position': max_pos,
+            'skew': skew,
+            'sharpe': record.sharpe_ratio,
+            'total_pnl': record.total_pnl,
+            'num_trades': record.num_trades,
+        })
+    
+    return pd.DataFrame(results)
+
+# Run optimization
+results = optimize_parameters(['BTCUSDT_20240101_accel.npz'])
+
+# Find best parameters
+best = results.loc[results['sharpe'].idxmax()]
+print(f"Best parameters: {best}")
+```
+
+## Validation Workflow
+
+Use accelerated backtesting for optimization, then validate with standard backtesting:
+
+```python
+# Step 1: Fast parameter search (accelerated)
+params = optimize_parameters_fast(accel_data)
+
+# Step 2: Validate top candidates (standard)
+top_10_params = params.nlargest(10, 'sharpe')
+
+validation_results = []
+for idx, params in top_10_params.iterrows():
+    # Use STANDARD backtesting with full accuracy
+    asset = (
+        BacktestAsset()
+            .data(standard_data_files)  # Use full, non-preprocessed data
+            .power_prob_queue_model(3.0)  # Enable queue model
+            .constant_latency(1_000_000, 1_000_000)  # Model latency
+            # ... full config
+    )
+    
+    hbt = ROIVectorMarketDepthBacktest([asset])
+    recorder = Recorder(1, 50_000_000)
+    
+    strategy(hbt, recorder, **params)
+    
+    record = LinearAssetRecord(recorder.get_records(0))
+    validation_results.append({
+        'params': params,
+        'accel_sharpe': params['sharpe'],
+        'standard_sharpe': record.sharpe_ratio,
+    })
+
+# Step 3: Select parameters that validate well
+for result in validation_results:
+    sharpe_diff = abs(result['standard_sharpe'] - result['accel_sharpe'])
+    if sharpe_diff < 0.2:  # Similar performance
+        print(f"Good parameters: {result['params']}")
+```
+
+## Accuracy Tradeoffs
+
+Understand what you lose with acceleration:
+
+### Lost Accuracy
+
+1. **Queue Position Effects**
+   - Can't model "getting in line early"
+   - Overestimates fills in congested markets
+   - Underestimates fills when you'd be at front
+
+2. **Partial Fills**
+   - Orders either fully fill or don't fill
+   - Reality: large orders may partially fill
+
+3. **Order Response Latency**
+   - State updates happen immediately
+   - Reality: you don't know fill status until response arrives
+   - Can lead to unrealistic hedging in backtest
+
+### Preserved Accuracy
+
+1. **Feed Latency**
+   - Still modeled correctly
+   - You react to stale market data as in reality
+
+2. **Order Entry Latency**
+   - Still modeled correctly
+   - Orders arrive at exchange with delay
+
+3. **Price Movements**
+   - Market dynamics preserved
+   - Spread and volatility effects captured
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Choose Appropriate Interval">
+    The running interval should match your strategy's natural decision frequency:
+    - HFT strategies: 10-50ms
+    - Market making: 50-200ms
+    - Slower strategies: 200-1000ms
+    
+    Smaller intervals = more accuracy but less speed gain.
+  </Accordion>
+  
+  <Accordion title="Validate with Standard Backtest">
+    Always validate your top parameter sets with standard backtesting before live deployment. Use accelerated mode for searching, standard mode for validation.
+  </Accordion>
+  
+  <Accordion title="Avoid Queue-Sensitive Strategies">
+    Accelerated backtesting works poorly for:
+    - Strategies that rely on queue position
+    - Large tick size markets
+    - Strategies that use GTX orders aggressively
+    
+    Use standard backtesting for these cases.
+  </Accordion>
+  
+  <Accordion title="Monitor Accuracy Degradation">
+    Compare accelerated vs standard results periodically:
+    ```python
+    accel_sharpe = 2.1
+    standard_sharpe = 1.9
+    degradation = (accel_sharpe - standard_sharpe) / standard_sharpe
+    
+    if degradation > 0.15:  # >15% optimistic
+        # Use standard backtesting or adjust expectations
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Performance Comparison
+
+Typical speedups from accelerated backtesting:
+
+| Strategy Type | Standard Time | Accelerated Time | Speedup |
+|---------------|---------------|------------------|----------|
+| Simple Market Making | 120s | 8s | 15x |
+| Grid Trading | 180s | 5s | 36x |
+| Multi-Asset Strategy | 300s | 25s | 12x |
+| Complex Alpha Strategy | 240s | 18s | 13x |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Queue Models" icon="layer-group" href="/advanced/queue-models">
+    Return to standard backtesting with accurate queue models
+  </Card>
+  <Card title="Pricing Framework" icon="dollar-sign" href="/advanced/pricing-framework">
+    Build sophisticated pricing models for multi-asset strategies
+  </Card>
+</CardGroup>

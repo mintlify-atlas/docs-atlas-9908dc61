@@ -1,0 +1,141 @@
+---
+title: Python API Overview
+description: Overview of the HftBacktest Python API for high-frequency trading backtesting
+---
+
+The HftBacktest Python API provides a comprehensive framework for backtesting high-frequency trading strategies with accurate latency modeling and order fill simulation.
+
+## Installation
+
+Install HftBacktest using pip:
+
+```bash
+pip install hftbacktest
+```
+
+Requires Python 3.11 or higher.
+
+## Quick Start
+
+Here's a minimal example of a market-making strategy:
+
+```python
+from numba import njit
+import numpy as np
+from hftbacktest import (
+    BacktestAsset,
+    HashMapMarketDepthBacktest,
+    BUY, SELL, GTX, LIMIT
+)
+
+@njit
+def market_making_algo(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    lot_size = hbt.depth(asset_no).lot_size
+    
+    # Time in nanoseconds
+    while hbt.elapse(10_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Submit buy and sell orders
+        hbt.submit_buy_order(
+            asset_no, 
+            order_id=1, 
+            price=depth.best_bid, 
+            qty=lot_size, 
+            time_in_force=GTX, 
+            order_type=LIMIT, 
+            wait=False
+        )
+        hbt.submit_sell_order(
+            asset_no,
+            order_id=2,
+            price=depth.best_ask,
+            qty=lot_size,
+            time_in_force=GTX,
+            order_type=LIMIT,
+            wait=False
+        )
+    
+    return True
+
+# Setup backtest
+asset = (
+    BacktestAsset()
+        .data('data.npz')
+        .linear_asset(1.0)
+        .intp_order_latency('latency.npz')
+)
+
+hbt = HashMapMarketDepthBacktest([asset])
+market_making_algo(hbt)
+```
+
+## Core Concepts
+
+### Backtesting Workflow
+
+1. **Configure Assets**: Set up one or more trading assets with market data and latency models
+2. **Create Backtester**: Initialize a backtester instance (HashMap or ROIVector)
+3. **Implement Strategy**: Write your strategy as a Numba JIT-compiled function
+4. **Run Backtest**: Execute the strategy through the backtester
+5. **Analyze Results**: Use the statistics module to evaluate performance
+
+### Market Depth Models
+
+HftBacktest provides two market depth implementations:
+
+- **HashMapMarketDepth**: Uses a hashmap for efficient sparse order book storage
+- **ROIVectorMarketDepth**: Uses a vector for dense order book storage within a range of interest
+
+### Numba Integration
+
+Strategies run in Numba JIT-compiled functions for maximum performance. All core API methods are compatible with Numba's `@njit` decorator.
+
+## API Organization
+
+The Python API is organized into the following modules:
+
+- **[Main Classes](/api/python/hftbacktest)**: Core backtesting classes and market depth interfaces
+- **[Types](/api/python/types)**: Type definitions, constants, and data structures
+- **[Data](/api/python/data)**: Data loading, validation, and preparation utilities
+- **[Stats](/api/python/stats)**: Performance metrics and statistical analysis
+
+## Time Units
+
+By default, HftBacktest uses **nanoseconds** for all timestamps and durations. Ensure your data uses the same time unit, or adjust accordingly.
+
+## Order Management
+
+### Order IDs
+
+Each order must have a unique ID. There should not be any existing order with the same ID on both local and exchange sides.
+
+### Order Status
+
+Orders progress through states: `NEW` → `FILLED` / `CANCELED` / `EXPIRED`
+
+### Time-In-Force Options
+
+- `GTC`: Good 'till cancel
+- `GTX`: Post-only (maker-only)
+- `FOK`: Fill or kill
+- `IOC`: Immediate or cancel
+
+## Asset Types
+
+When configuring assets, specify the contract type:
+
+- **Linear assets**: Use `.linear_asset(contract_size)` for standard futures/spot
+- **Inverse assets**: Use `.inverse_asset(contract_size)` for inverse perpetuals
+
+## Next Steps
+
+- Explore the [HftBacktest class documentation](/api/python/hftbacktest)
+- Learn about [data types and constants](/api/python/types)
+- Review [data preparation utilities](/api/python/data)
+- Understand [performance metrics](/api/python/stats)

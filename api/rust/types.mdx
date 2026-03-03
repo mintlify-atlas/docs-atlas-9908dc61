@@ -1,0 +1,554 @@
+---
+title: Core Types
+description: Core type definitions for HftBacktest
+---
+
+The `types` module defines the core types used throughout HftBacktest, including orders, events, and the main `Bot` trait.
+
+## Order Management
+
+### Order
+
+Represents an order in the system.
+
+```rust
+pub struct Order {
+    pub qty: f64,
+    pub leaves_qty: f64,
+    pub exec_qty: f64,
+    pub exec_price_tick: i64,
+    pub price_tick: i64,
+    pub tick_size: f64,
+    pub exch_timestamp: i64,
+    pub local_timestamp: i64,
+    pub order_id: u64,
+    pub q: Box<dyn AnyClone + Send>,
+    pub maker: bool,
+    pub order_type: OrdType,
+    pub req: Status,
+    pub status: Status,
+    pub side: Side,
+    pub time_in_force: TimeInForce,
+}
+```
+
+**Fields:**
+
+- `qty` - Total order quantity
+- `leaves_qty` - Remaining unfilled quantity
+- `exec_qty` - Quantity filled in the last execution (only when executed)
+- `exec_price_tick` - Execution price in ticks (only when executed)
+- `price_tick` - Order price in ticks
+- `tick_size` - Tick size of the asset
+- `exch_timestamp` - Exchange processing timestamp
+- `local_timestamp` - Local send/receive timestamp
+- `order_id` - Unique order identifier
+- `q` - Queue model data (backtesting only, `()` in live)
+- `maker` - Whether executed as maker (only when executed)
+- `order_type` - Order type (Limit, Market)
+- `req` - Request status (New, Canceled, None)
+- `status` - Current order status
+- `side` - Buy or Sell
+- `time_in_force` - Time-in-force (GTC, GTX, FOK, IOC)
+
+**Methods:**
+
+```rust
+impl Order {
+    pub fn new(
+        order_id: u64,
+        price_tick: i64,
+        tick_size: f64,
+        qty: f64,
+        side: Side,
+        order_type: OrdType,
+        time_in_force: TimeInForce,
+    ) -> Self
+    
+    pub fn price(&self) -> f64
+    pub fn exec_price(&self) -> f64
+    pub fn cancellable(&self) -> bool
+    pub fn active(&self) -> bool
+    pub fn pending(&self) -> bool
+    pub fn update(&mut self, order: &Order)
+}
+```
+
+- `price()` - Returns the order price (price_tick * tick_size)
+- `exec_price()` - Returns the execution price (exec_price_tick * tick_size)
+- `cancellable()` - Returns true if the order can be canceled
+- `active()` - Returns true if the order is active in the market
+- `pending()` - Returns true if the order has an ongoing request
+- `update(order)` - Updates this order with values from another order
+
+### OrderRequest
+
+Simplified order structure for submissions in live trading.
+
+```rust
+pub struct OrderRequest {
+    pub order_id: u64,
+    pub price: f64,
+    pub qty: f64,
+    pub side: Side,
+    pub time_in_force: TimeInForce,
+    pub order_type: OrdType,
+}
+```
+
+### OrderId
+
+Type alias for order identifiers.
+
+```rust
+pub type OrderId = u64;
+```
+
+## Enumerations
+
+### Side
+
+Represents the side of an order or trade.
+
+```rust
+pub enum Side {
+    Buy = 1,
+    Sell = -1,
+    None = 0,
+    Unsupported = 127,
+}
+```
+
+**Variants:**
+
+- `Buy` - Buy order or trade initiated by buyer
+- `Sell` - Sell order or trade initiated by seller  
+- `None` - No side specified
+- `Unsupported` - Unsupported side value from connector
+
+**Trait Implementations:**
+
+```rust
+impl AsRef<f64> for Side {
+    fn as_ref(&self) -> &f64  // Buy=1.0, Sell=-1.0
+}
+
+impl AsRef<str> for Side {
+    fn as_ref(&self) -> &'static str  // "BUY" or "SELL"
+}
+```
+
+### Status
+
+Order status enumeration.
+
+```rust
+pub enum Status {
+    None = 0,
+    New = 1,
+    Expired = 2,
+    Filled = 3,
+    Canceled = 4,
+    PartiallyFilled = 5,
+    Rejected = 6,
+    Replaced = 7,
+    Unsupported = 255,
+}
+```
+
+### TimeInForce
+
+Order time-in-force options.
+
+```rust
+pub enum TimeInForce {
+    GTC = 0,   // Good 'Til Canceled
+    GTX = 1,   // Post-only
+    FOK = 2,   // Fill or Kill
+    IOC = 3,   // Immediate or Cancel
+    Unsupported = 255,
+}
+```
+
+**Trait Implementations:**
+
+```rust
+impl AsRef<str> for TimeInForce {
+    fn as_ref(&self) -> &'static str  // "GTC", "GTX", "FOK", or "IOC"
+}
+```
+
+### OrdType
+
+Order type enumeration.
+
+```rust
+pub enum OrdType {
+    Limit = 0,
+    Market = 1,
+    Unsupported = 255,
+}
+```
+
+**Trait Implementations:**
+
+```rust
+impl AsRef<str> for OrdType {
+    fn as_ref(&self) -> &'static str  // "LIMIT" or "MARKET"
+}
+```
+
+## Events
+
+### Event
+
+Feed event data structure.
+
+```rust
+#[repr(C, align(64))]
+pub struct Event {
+    pub ev: u64,
+    pub exch_ts: i64,
+    pub local_ts: i64,
+    pub px: f64,
+    pub qty: f64,
+    pub order_id: u64,
+    pub ival: i64,
+    pub fval: f64,
+}
+```
+
+**Fields:**
+
+- `ev` - Event flags (combination of event type constants)
+- `exch_ts` - Exchange timestamp
+- `local_ts` - Local receipt timestamp
+- `px` - Price
+- `qty` - Quantity
+- `order_id` - Order ID (for Level-3 Market-By-Order feeds)
+- `ival` - Reserved for additional i64 value
+- `fval` - Reserved for additional f64 value
+
+**Methods:**
+
+```rust
+impl Event {
+    pub fn is(&self, event: u64) -> bool
+}
+```
+
+- `is(event)` - Checks if this event matches the given event type
+
+### Event Type Constants
+
+Event flags are bit flags that can be combined:
+
+```rust
+// Event types
+pub const DEPTH_EVENT: u64 = 1;
+pub const TRADE_EVENT: u64 = 2;
+pub const DEPTH_CLEAR_EVENT: u64 = 3;
+pub const DEPTH_SNAPSHOT_EVENT: u64 = 4;
+pub const DEPTH_BBO_EVENT: u64 = 5;
+pub const ADD_ORDER_EVENT: u64 = 10;     // L3
+pub const CANCEL_ORDER_EVENT: u64 = 11;  // L3
+pub const MODIFY_ORDER_EVENT: u64 = 12;  // L3
+pub const FILL_EVENT: u64 = 13;          // L3
+
+// Side indicators
+pub const BUY_EVENT: u64 = 1 << 29;
+pub const SELL_EVENT: u64 = 1 << 28;
+
+// Processor indicators
+pub const EXCH_EVENT: u64 = 1 << 31;
+pub const LOCAL_EVENT: u64 = 1 << 30;
+```
+
+**Combined Event Constants:**
+
+```rust
+// Local events
+pub const LOCAL_BID_DEPTH_EVENT: u64 = DEPTH_EVENT | BUY_EVENT | LOCAL_EVENT;
+pub const LOCAL_ASK_DEPTH_EVENT: u64 = DEPTH_EVENT | SELL_EVENT | LOCAL_EVENT;
+pub const LOCAL_BUY_TRADE_EVENT: u64 = TRADE_EVENT | BUY_EVENT | LOCAL_EVENT;
+pub const LOCAL_SELL_TRADE_EVENT: u64 = TRADE_EVENT | SELL_EVENT | LOCAL_EVENT;
+pub const LOCAL_BID_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | BUY_EVENT | LOCAL_EVENT;
+pub const LOCAL_ASK_DEPTH_CLEAR_EVENT: u64 = DEPTH_CLEAR_EVENT | SELL_EVENT | LOCAL_EVENT;
+pub const LOCAL_BID_DEPTH_SNAPSHOT_EVENT: u64 = DEPTH_SNAPSHOT_EVENT | BUY_EVENT | LOCAL_EVENT;
+pub const LOCAL_ASK_DEPTH_SNAPSHOT_EVENT: u64 = DEPTH_SNAPSHOT_EVENT | SELL_EVENT | LOCAL_EVENT;
+
+// Exchange events
+pub const EXCH_BID_DEPTH_EVENT: u64 = DEPTH_EVENT | BUY_EVENT | EXCH_EVENT;
+pub const EXCH_ASK_DEPTH_EVENT: u64 = DEPTH_EVENT | SELL_EVENT | EXCH_EVENT;
+pub const EXCH_BUY_TRADE_EVENT: u64 = TRADE_EVENT | BUY_EVENT | EXCH_EVENT;
+pub const EXCH_SELL_TRADE_EVENT: u64 = TRADE_EVENT | SELL_EVENT | EXCH_EVENT;
+// ... and more
+```
+
+**Example:**
+
+```rust
+use hftbacktest::types::{Event, LOCAL_BID_DEPTH_EVENT, LOCAL_ASK_DEPTH_EVENT};
+
+fn process_event(event: &Event) {
+    if event.is(LOCAL_BID_DEPTH_EVENT) {
+        println!("Bid depth update: {} @ {}", event.qty, event.px);
+    } else if event.is(LOCAL_ASK_DEPTH_EVENT) {
+        println!("Ask depth update: {} @ {}", event.qty, event.px);
+    }
+}
+```
+
+## State Management
+
+### StateValues
+
+Provides state values for tracking bot performance.
+
+```rust
+pub struct StateValues {
+    pub position: f64,
+    pub balance: f64,      // Backtest only
+    pub fee: f64,          // Backtest only
+    pub num_trades: i64,   // Backtest only
+    pub trading_volume: f64,  // Backtest only
+    pub trading_value: f64,   // Backtest only
+}
+```
+
+Note: In live trading, only `position` is currently populated correctly.
+
+## Bot Trait
+
+The core trait implemented by both `Backtest` and `LiveBot`.
+
+```rust
+pub trait Bot<MD>
+where
+    MD: MarketDepth,
+{
+    type Error;
+
+    fn current_timestamp(&self) -> i64;
+    fn num_assets(&self) -> usize;
+    fn position(&self, asset_no: usize) -> f64;
+    fn state_values(&self, asset_no: usize) -> &StateValues;
+    fn depth(&self, asset_no: usize) -> &MD;
+    fn last_trades(&self, asset_no: usize) -> &[Event];
+    fn clear_last_trades(&mut self, asset_no: Option<usize>);
+    fn orders(&self, asset_no: usize) -> &HashMap<OrderId, Order>;
+    
+    fn submit_buy_order(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        order_type: OrdType,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn submit_sell_order(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        price: f64,
+        qty: f64,
+        time_in_force: TimeInForce,
+        order_type: OrdType,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn submit_order(
+        &mut self,
+        asset_no: usize,
+        order: OrderRequest,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn modify(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        price: f64,
+        qty: f64,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn cancel(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        wait: bool,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn clear_inactive_orders(&mut self, asset_no: Option<usize>);
+    
+    fn wait_order_response(
+        &mut self,
+        asset_no: usize,
+        order_id: OrderId,
+        timeout: i64,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn wait_next_feed(
+        &mut self,
+        include_order_resp: bool,
+        timeout: i64,
+    ) -> Result<ElapseResult, Self::Error>;
+    
+    fn elapse(&mut self, duration: i64) -> Result<ElapseResult, Self::Error>;
+    fn elapse_bt(&mut self, duration: i64) -> Result<ElapseResult, Self::Error>;
+    fn close(&mut self) -> Result<(), Self::Error>;
+    fn feed_latency(&self, asset_no: usize) -> Option<(i64, i64)>;
+    fn order_latency(&self, asset_no: usize) -> Option<(i64, i64, i64)>;
+}
+```
+
+**Key Methods:**
+
+- `current_timestamp()` - Current timestamp (backtest time or actual time)
+- `num_assets()` - Number of registered assets
+- `position(asset_no)` - Current position for the asset
+- `state_values(asset_no)` - State values (balance, fees, etc.)
+- `depth(asset_no)` - Market depth for the asset
+- `last_trades(asset_no)` - Recent market trades
+- `orders(asset_no)` - Active and recent orders
+- `submit_buy_order(...)` / `submit_sell_order(...)` - Submit orders
+- `cancel(asset_no, order_id, wait)` - Cancel an order
+- `elapse(duration)` - Advance time by duration
+- `wait_next_feed(...)` - Wait for next market data
+
+### ElapseResult
+
+Result type returned by time-related methods.
+
+```rust
+pub enum ElapseResult {
+    Ok,
+    EndOfData,
+    MarketFeed,
+    OrderResponse,
+}
+```
+
+## Recorder Trait
+
+Provides recording functionality for bot statistics.
+
+```rust
+pub trait Recorder {
+    type Error;
+    
+    fn record<MD, I>(&mut self, hbt: &I) -> Result<(), Self::Error>
+    where
+        I: Bot<MD>,
+        MD: MarketDepth;
+}
+```
+
+## Error Types
+
+### BuildError
+
+Errors that can occur during builder operations.
+
+```rust
+pub enum BuildError {
+    BuilderIncomplete(&'static str),
+    InvalidArgument(&'static str),
+    Duplicate(String, String),
+    ConnectorNotFound(String),
+    Error(anyhow::Error),
+}
+```
+
+## Constants
+
+### Time Constants
+
+```rust
+pub const UNTIL_END_OF_DATA: i64 = i64::MAX;
+```
+
+Used with `elapse()` to continue until the end of data.
+
+## Usage Examples
+
+### Working with Orders
+
+```rust
+use hftbacktest::types::{Order, Side, OrdType, TimeInForce, Status};
+
+let order = Order::new(
+    12345,              // order_id
+    10000,              // price_tick (100.00 with tick_size 0.01)
+    0.01,               // tick_size
+    10.0,               // qty
+    Side::Buy,
+    OrdType::Limit,
+    TimeInForce::GTC,
+);
+
+assert_eq!(order.price(), 100.0);
+assert!(order.active());
+assert!(!order.pending());
+```
+
+### Checking Event Types
+
+```rust
+use hftbacktest::types::{
+    Event,
+    LOCAL_BID_DEPTH_EVENT,
+    LOCAL_ASK_DEPTH_EVENT,
+    LOCAL_BUY_TRADE_EVENT,
+};
+
+fn handle_event(event: &Event) {
+    if event.is(LOCAL_BID_DEPTH_EVENT) {
+        println!("Bid updated: {} @ {}", event.qty, event.px);
+    } else if event.is(LOCAL_ASK_DEPTH_EVENT) {
+        println!("Ask updated: {} @ {}", event.qty, event.px);
+    } else if event.is(LOCAL_BUY_TRADE_EVENT) {
+        println!("Buy trade: {} @ {}", event.qty, event.px);
+    }
+}
+```
+
+### Using the Bot Trait
+
+```rust
+use hftbacktest::{
+    types::{Bot, OrdType, TimeInForce},
+    depth::MarketDepth,
+};
+
+fn simple_strategy<MD, B>(bot: &mut B) -> Result<(), B::Error>
+where
+    MD: MarketDepth,
+    B: Bot<MD>,
+{
+    let asset_no = 0;
+    let depth = bot.depth(asset_no);
+    
+    let mid = (depth.best_bid() + depth.best_ask()) / 2.0;
+    let position = bot.position(asset_no);
+    
+    if position == 0.0 {
+        bot.submit_buy_order(
+            asset_no,
+            1,
+            mid - 1.0,
+            10.0,
+            TimeInForce::GTC,
+            OrdType::Limit,
+            false,
+        )?;
+    }
+    
+    bot.elapse(1_000_000_000)?; // 1 second
+    Ok(())
+}
+```

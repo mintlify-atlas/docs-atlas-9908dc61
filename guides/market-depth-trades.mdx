@@ -1,0 +1,292 @@
+---
+title: Working with Market Depth and Trades
+description: Understand how to access and utilize market depth and trade data in your strategies
+---
+
+HftBacktest provides comprehensive access to market depth (order book) and trade data, enabling you to build sophisticated high-frequency trading strategies.
+
+## Accessing Market Depth
+
+The market depth object provides real-time order book information:
+
+```python
+from numba import njit
+
+@njit
+def strategy(hbt):
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    
+    # Access best bid and ask
+    best_bid = depth.best_bid
+    best_ask = depth.best_ask
+    best_bid_tick = depth.best_bid_tick
+    best_ask_tick = depth.best_ask_tick
+    
+    # Calculate mid price
+    mid_price = (best_bid + best_ask) / 2.0
+    
+    # Get market metadata
+    tick_size = depth.tick_size
+    lot_size = depth.lot_size
+```
+
+## Market Depth Properties
+
+<Note>
+All depth updates are based on Level-2 (Market-By-Price) or Level-3 (Market-By-Order) feed reconstruction.
+</Note>
+
+### Price Levels
+
+- `best_bid`: Best bid price
+- `best_ask`: Best ask price
+- `best_bid_tick`: Best bid price in tick units
+- `best_ask_tick`: Best ask price in tick units
+
+### Market Parameters
+
+- `tick_size`: Minimum price increment
+- `lot_size`: Minimum quantity increment
+
+## Working with Trades
+
+Access recent market trades to analyze trade flow and market pressure:
+
+```python
+from hftbacktest import BUY_EVENT, SELL_EVENT
+
+@njit
+def analyze_trades(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    mid_price_tick = (hbt.depth(asset_no).best_bid_tick + 
+                      hbt.depth(asset_no).best_ask_tick) / 2.0
+    
+    # Iterate through recent trades
+    for trade in hbt.last_trades(asset_no):
+        trade_price = trade.px
+        trade_qty = trade.qty
+        trade_price_tick = trade.px / tick_size
+        
+        # Determine trade direction
+        if trade.ev & BUY_EVENT == BUY_EVENT:
+            # This was a buy (market buy that lifted the ask)
+            depth_from_mid = trade_price_tick - mid_price_tick
+        elif trade.ev & SELL_EVENT == SELL_EVENT:
+            # This was a sell (market sell that hit the bid)
+            depth_from_mid = mid_price_tick - trade_price_tick
+```
+
+### Clear Trade History
+
+Clear the trade buffer after processing:
+
+```python
+@njit
+def strategy(hbt):
+    asset_no = 0
+    
+    # Process trades
+    for trade in hbt.last_trades(asset_no):
+        # ... analyze trade
+        pass
+    
+    # Clear the buffer to avoid reprocessing
+    hbt.clear_last_trades(asset_no)
+```
+
+## Price Tick Conversion
+
+Working in tick units simplifies calculations and improves performance:
+
+```python
+@njit
+def tick_calculations(hbt):
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    tick_size = depth.tick_size
+    
+    # Convert price to ticks
+    price = 61800.5
+    price_tick = round(price / tick_size)
+    
+    # Convert ticks back to price
+    price_from_tick = price_tick * tick_size
+    
+    # Align price to tick grid
+    aligned_price = round(price / tick_size) * tick_size
+```
+
+<Warning>
+Always ensure prices are aligned to the tick grid before submitting orders, or they will be rejected.
+</Warning>
+
+## Calculating Market Indicators
+
+### Mid Price and Spread
+
+```python
+@njit
+def market_metrics(hbt):
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    
+    mid_price = (depth.best_bid + depth.best_ask) / 2.0
+    spread = depth.best_ask - depth.best_bid
+    spread_bps = (spread / mid_price) * 10000
+    
+    return mid_price, spread, spread_bps
+```
+
+### Order Book Imbalance
+
+Calculate the order book imbalance to detect buying/selling pressure:
+
+```python
+@njit
+def order_book_imbalance(hbt):
+    asset_no = 0
+    depth = hbt.depth(asset_no)
+    
+    # Simple imbalance at best levels
+    # Note: In practice, you'd sum multiple levels
+    bid_qty = depth.bid_qty_at_tick(depth.best_bid_tick)
+    ask_qty = depth.ask_qty_at_tick(depth.best_ask_tick)
+    
+    if bid_qty + ask_qty > 0:
+        imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty)
+    else:
+        imbalance = 0.0
+    
+    return imbalance
+```
+
+## Measuring Trade Intensity
+
+Track how deep market orders penetrate the order book:
+
+```python
+import numpy as np
+from numba import njit
+
+@njit
+def measure_order_arrival_depth(hbt, arrival_depth, mid_price_tick, t):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    depth = -np.inf
+    for trade in hbt.last_trades(asset_no):
+        trade_price_tick = trade.px / tick_size
+        
+        if trade.ev & BUY_EVENT == BUY_EVENT:
+            # Buy market order - measure from mid to trade price
+            depth = max(trade_price_tick - mid_price_tick, depth)
+        else:
+            # Sell market order
+            depth = max(mid_price_tick - trade_price_tick, depth)
+    
+    arrival_depth[t] = depth if np.isfinite(depth) else np.nan
+```
+
+<Note>
+Order arrival depth is crucial for calibrating market making models like GLFT.
+</Note>
+
+## Market Depth Backtesting
+
+HftBacktest offers different depth implementations:
+
+### HashMap Market Depth
+
+Best for most use cases:
+
+```python
+from hftbacktest import HashMapMarketDepthBacktest
+
+hbt = HashMapMarketDepthBacktest([asset])
+```
+
+### ROI Vector Market Depth
+
+Optimized for strategies with limited price range:
+
+```python
+from hftbacktest import ROIVectorMarketDepthBacktest, BacktestAsset
+
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240809.npz'])
+        .roi_lb(60000.0)  # Lower bound
+        .roi_ub(65000.0)  # Upper bound
+)
+
+hbt = ROIVectorMarketDepthBacktest([asset])
+```
+
+<Warning>
+ROI Vector is faster but will error if price moves outside the specified range.
+</Warning>
+
+## Complete Example
+
+Here's a complete example that uses depth and trade data:
+
+```python
+import numpy as np
+from numba import njit
+from hftbacktest import (
+    BacktestAsset,
+    HashMapMarketDepthBacktest,
+    BUY_EVENT,
+    SELL_EVENT
+)
+
+@njit
+def monitor_market(hbt):
+    asset_no = 0
+    
+    while hbt.elapse(1_000_000_000) == 0:  # Every second
+        depth = hbt.depth(asset_no)
+        
+        # Market depth metrics
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        spread = depth.best_ask - depth.best_bid
+        
+        # Trade flow analysis
+        buy_volume = 0.0
+        sell_volume = 0.0
+        
+        for trade in hbt.last_trades(asset_no):
+            if trade.ev & BUY_EVENT == BUY_EVENT:
+                buy_volume += trade.qty
+            elif trade.ev & SELL_EVENT == SELL_EVENT:
+                sell_volume += trade.qty
+        
+        hbt.clear_last_trades(asset_no)
+        
+        print(f"Mid: {mid_price:.2f}, Spread: {spread:.2f}")
+        print(f"Buy Vol: {buy_volume:.3f}, Sell Vol: {sell_volume:.3f}")
+    
+    return True
+
+# Set up backtest
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240809.npz'])
+        .initial_snapshot('data/btcusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+
+hbt = HashMapMarketDepthBacktest([asset])
+monitor_market(hbt)
+_ = hbt.close()
+```
+
+## Next Steps
+
+- Learn about [Integrating Custom Data](/guides/custom-data)
+- Explore [Market Making Strategies](/guides/market-making)
+- See [Grid Trading Implementation](/guides/grid-trading)

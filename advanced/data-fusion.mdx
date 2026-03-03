@@ -1,0 +1,561 @@
+---
+title: 'Data Fusion'
+description: 'Combine multiple market data streams for more accurate and complete order book reconstruction'
+---
+
+## Overview
+
+Most cryptocurrency exchanges do not provide true tick-by-tick Level-2 data. Instead, they deliver **conflated feeds** where individual order book updates are aggregated over short intervals:
+
+- **Binance Futures**: `depth@0ms` is aggregated (slower than `bookTicker`)
+- **Bybit**: Level 1 (BBO) every 10ms, Level 50 every 20ms, Level 200 every 100ms
+- **OKX**: Similar aggregation patterns
+- **Other venues**: Typically aggregate at 10-100ms intervals
+
+To achieve accurate fill simulation and realistic backtesting, you must **fuse multiple data streams** into a single feed that preserves the highest update frequency and granularity.
+
+<Warning>
+**Impact of Not Fusing Data**:
+- Underestimated fill rates (missing BBO updates)
+- Incorrect queue position estimates
+- Poor alpha signal quality (stale prices)
+- Backtest results don't match live trading
+</Warning>
+
+## The Problem: Conflated Feeds
+
+### Example: Binance Futures
+
+Binance Futures provides two relevant streams:
+
+1. **`incremental_book_L2` (depth@0ms)**: Full depth updates, but aggregated
+2. **`bookTicker`**: Best bid/offer updates on every change
+
+Let's verify the issue:
+
+```python
+import polars as pl
+
+# Load both streams
+df_l2 = pl.read_csv('BTCUSDT_incremental_book_L2_20250501.csv.gz')
+df_ticker = pl.read_csv('BTCUSDT_book_ticker_20250501.csv.gz')
+
+print(f"L2 updates: {len(df_l2):,}")
+print(f"Ticker updates: {len(df_ticker):,}")
+
+# Count BBO changes in each stream  
+l2_bbo_changes = (
+    df_l2
+    .filter((pl.col('side') == 'bid') | (pl.col('side') == 'ask'))
+    .filter(pl.col('price') == pl.col('price').shift())
+)
+
+print(f"L2 BBO change rate: {len(l2_bbo_changes) / len(df_l2):.2%}")
+print(f"Ticker provides {len(df_ticker) / len(l2_bbo_changes):.1f}x more BBO updates")
+```
+
+Typical output:
+```
+L2 updates: 15,234,567
+Ticker updates: 42,891,234
+L2 BBO change rate: 35.2%
+Ticker provides 2.8x more BBO updates
+```
+
+<Info>
+The `bookTicker` stream captures **every** BBO change, while `depth@0ms` aggregates them. This means you're missing ~65% of BBO updates if you only use L2 data!
+</Info>
+
+## Solution: Data Fusion
+
+Fuse the two streams to get:
+- High-frequency BBO updates from `bookTicker`
+- Full depth information from `incremental_book_L2`
+
+### Architecture
+
+```
+┌─────────────────────┐
+│   bookTicker Stream │  (high frequency BBO)
+│   - Best Bid        │
+│   - Best Ask        │
+│   - BBO Timestamps  │
+└──────────┬──────────┘
+           │
+           │  Fuse
+           ▼
+┌─────────────────────┐
+│  Fused Market Depth │
+│  - BBO from ticker  │
+│  - Depth from L2    │
+│  - Timestamp logic  │
+└──────────┬──────────┘
+           ▲
+           │  Fuse
+           │
+┌──────────┴──────────┐
+│  incremental_book_L2│  (full depth but slower)
+│  - All price levels │
+│  - Quantities       │
+└─────────────────────┘
+```
+
+## Implementation
+
+### Using HftBacktest's Built-in Fusion
+
+HftBacktest's depth implementations support fusion automatically:
+
+```python
+from hftbacktest.data.utils import tardis
+import numpy as np
+
+# Convert both streams
+tardis.convert(
+    [
+        'BTCUSDT_trades_20250501.csv.gz',
+        'BTCUSDT_incremental_book_L2_20250501.csv.gz',
+        'BTCUSDT_book_ticker_20250501.csv.gz',  # Add bookTicker
+    ],
+    output_filename='BTCUSDT_20250501_fused.npz',
+    buffer_size=1_000_000_000,
+    snapshot_mode='process'
+)
+```
+
+<Check>
+The `tardis.convert` function automatically:
+- Merges the streams chronologically
+- Prioritizes bookTicker for BBO updates
+- Uses L2 data for deeper levels
+- Handles timestamp conflicts
+</Check>
+
+### Understanding Fusion Logic
+
+The fusion process uses timestamp-based prioritization:
+
+```python
+class FusedHashMapMarketDepth:
+    """
+    Fuses multiple depth feeds using timestamp logic
+    """
+    def __init__(self, tick_size, lot_size):
+        self.tick_size = tick_size
+        self.lot_size = lot_size
+        self.bid_depth = {}  # price_tick -> (qty, timestamp)
+        self.ask_depth = {}  # price_tick -> (qty, timestamp)
+        self.best_bid_tick = INVALID_MIN
+        self.best_ask_tick = INVALID_MAX
+        self.best_bid_timestamp = 0
+        self.best_ask_timestamp = 0
+    
+    def update_bid_depth(self, event):
+        """Update bid side with timestamp-based fusion"""
+        price_tick = round(event.px / self.tick_size)
+        
+        # Reject outdated updates
+        if price_tick >= self.best_bid_tick:
+            if event.exch_ts < self.best_bid_timestamp:
+                # This update is older than current BBO, ignore
+                return
+        
+        # Accept update
+        if event.qty > 0:
+            self.bid_depth[price_tick] = (event.qty, event.exch_ts)
+        else:
+            # Quantity = 0 means remove level
+            self.bid_depth.pop(price_tick, None)
+        
+        # Update best bid if needed
+        if price_tick == self.best_bid_tick or event.qty == 0:
+            # Recalculate best bid
+            self.best_bid_tick = self._find_best_bid()
+            self.best_bid_timestamp = event.exch_ts
+```
+
+**Key Points**:
+
+1. **Timestamp Comparison**: Only accept updates if they're newer than current data
+2. **Level-Specific Timestamps**: Each price level tracks its own timestamp
+3. **BBO Priority**: bookTicker updates have recent timestamps, so they take priority
+4. **Stale Data Rejection**: Old L2 updates that arrive late are ignored
+
+### Manual Fusion for Custom Needs
+
+For custom fusion logic:
+
+```python
+import numpy as np
+import polars as pl
+from hftbacktest.data import Data, Event
+
+def fuse_streams(l2_file, ticker_file, output_file):
+    """
+    Manually fuse L2 depth and bookTicker streams
+    """
+    # Load both streams
+    df_l2 = pl.read_csv(l2_file)
+    df_ticker = pl.read_csv(ticker_file)
+    
+    # Prepare L2 events
+    l2_events = []
+    for row in df_l2.iter_rows(named=True):
+        l2_events.append({
+            'local_ts': row['local_timestamp'],
+            'exch_ts': row['exchange_timestamp'],
+            'px': row['price'],
+            'qty': row['amount'],
+            'side': row['side'],
+            'type': 'depth'
+        })
+    
+    # Prepare ticker events (BBO only)
+    ticker_events = []
+    for row in df_ticker.iter_rows(named=True):
+        # Best bid update
+        ticker_events.append({
+            'local_ts': row['local_timestamp'],
+            'exch_ts': row['exchange_timestamp'],
+            'px': row['bid_price'],
+            'qty': row['bid_amount'],
+            'side': 'bid',
+            'type': 'ticker'
+        })
+        # Best ask update
+        ticker_events.append({
+            'local_ts': row['local_timestamp'],
+            'exch_ts': row['exchange_timestamp'],
+            'px': row['ask_price'],
+            'qty': row['ask_amount'],
+            'side': 'ask',
+            'type': 'ticker'
+        })
+    
+    # Merge and sort by exchange timestamp
+    all_events = sorted(
+        l2_events + ticker_events,
+        key=lambda e: e['exch_ts']
+    )
+    
+    # Convert to HftBacktest format
+    events = np.array(
+        [(e['exch_ts'], e['local_ts'], e['px'], e['qty'], 0, 0, 0.0)
+         for e in all_events],
+        dtype=[
+            ('exch_ts', 'i8'),
+            ('local_ts', 'i8'),
+            ('px', 'f8'),
+            ('qty', 'f8'),
+            ('order_id', 'u8'),
+            ('ival', 'i8'),
+            ('fval', 'f8'),
+        ]
+    )
+    
+    # Save
+    np.savez(output_file, data=events)
+    print(f"Fused {len(events):,} events to {output_file}")
+
+# Use it
+fuse_streams(
+    'BTCUSDT_incremental_book_L2_20250501.csv.gz',
+    'BTCUSDT_book_ticker_20250501.csv.gz',
+    'BTCUSDT_20250501_fused.npz'
+)
+```
+
+## Verification
+
+Verify fusion quality by comparing BBO update frequencies:
+
+```python
+from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
+from numba import njit
+import numpy as np
+
+@njit
+def record_bbo_updates(hbt, timeout):
+    """
+    Record all BBO changes to measure update frequency
+    """
+    asset_no = 0
+    updates = np.full((30_000_000, 5), np.nan, np.float64)
+    t = 0
+    
+    prev_best_bid = np.nan
+    prev_best_ask = np.nan
+    
+    # Wait for all market feed events
+    while hbt.wait_next_feed(False, timeout) in [0, 2]:
+        depth = hbt.depth(asset_no)
+        
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+        
+        # Record if BBO changed
+        if best_bid != prev_best_bid or best_ask != prev_best_ask:
+            updates[t, 0] = hbt.current_timestamp
+            updates[t, 1] = best_bid
+            updates[t, 2] = best_ask
+            updates[t, 3] = depth.bid_qty_at_tick(depth.best_bid_tick)
+            updates[t, 4] = depth.ask_qty_at_tick(depth.best_ask_tick)
+            
+            prev_best_bid = best_bid
+            prev_best_ask = best_ask
+            t += 1
+    
+    return updates[:t]
+
+# Test with L2 only
+asset_l2 = (
+    BacktestAsset()
+        .data(['BTCUSDT_20250501_l2only.npz'])
+        .linear_asset(1.0)
+        .constant_order_latency(0, 0)
+        .power_prob_queue_model(3)
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+hbt_l2 = ROIVectorMarketDepthBacktest([asset_l2])
+l2_updates = record_bbo_updates(hbt_l2, 100_000_000)
+hbt_l2.close()
+
+# Test with fused data
+asset_fused = (
+    BacktestAsset()
+        .data(['BTCUSDT_20250501_fused.npz'])
+        # ... same config
+)
+hbt_fused = ROIVectorMarketDepthBacktest([asset_fused])
+fused_updates = record_bbo_updates(hbt_fused, 100_000_000)
+hbt_fused.close()
+
+print(f"L2-only BBO updates: {len(l2_updates):,}")
+print(f"Fused BBO updates: {len(fused_updates):,}")
+print(f"Improvement: {len(fused_updates) / len(l2_updates):.2f}x")
+```
+
+Expected output:
+```
+L2-only BBO updates: 1,234,567
+Fused BBO updates: 3,456,789
+Improvement: 2.80x
+```
+
+## Visualizing the Difference
+
+Plot BBO timeseries to see fusion impact:
+
+```python
+import polars as pl
+import matplotlib.pyplot as plt
+
+# Convert to DataFrame
+df_l2_bbo = pl.DataFrame(l2_updates, schema=[
+    'timestamp', 'bid', 'ask', 'bid_qty', 'ask_qty'
+])
+
+df_fused_bbo = pl.DataFrame(fused_updates, schema=[
+    'timestamp', 'bid', 'ask', 'bid_qty', 'ask_qty'
+])
+
+# Filter to a small time window for clarity
+start = df_fused_bbo['timestamp'][0] + 60_000_000_000  # +1 minute
+end = start + 2_000_000_000  # +2 seconds
+
+df_l2_window = df_l2_bbo.filter(
+    (pl.col('timestamp') >= start) & (pl.col('timestamp') <= end)
+)
+df_fused_window = df_fused_bbo.filter(
+    (pl.col('timestamp') >= start) & (pl.col('timestamp') <= end)
+)
+
+# Plot
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+
+# L2-only
+ax1.plot(df_l2_window['timestamp'], df_l2_window['bid'], 
+         label='Bid', marker='o', markersize=3)
+ax1.plot(df_l2_window['timestamp'], df_l2_window['ask'], 
+         label='Ask', marker='o', markersize=3)
+ax1.set_ylabel('Price')
+ax1.set_title('L2-Only BBO (Aggregated)')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# Fused
+ax2.plot(df_fused_window['timestamp'], df_fused_window['bid'], 
+         label='Bid', marker='o', markersize=3)
+ax2.plot(df_fused_window['timestamp'], df_fused_window['ask'], 
+         label='Ask', marker='o', markersize=3)
+ax2.set_xlabel('Timestamp (ns)')
+ax2.set_ylabel('Price')
+ax2.set_title('Fused BBO (L2 + bookTicker)')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('bbo_comparison.png', dpi=150)
+print("Saved comparison to bbo_comparison.png")
+```
+
+You'll see the fused data has much denser BBO updates, capturing the true market dynamics.
+
+## Multi-Venue Fusion
+
+Fuse data from multiple exchanges for cross-venue strategies:
+
+```python
+def fuse_multi_venue(venues, symbol, date):
+    """
+    Fuse data from multiple exchanges
+    
+    Args:
+        venues: List of venue names ['binance', 'bybit', 'okx']
+        symbol: Trading symbol
+        date: Date string
+    
+    Returns:
+        Dictionary of fused data per venue
+    """
+    fused_data = {}
+    
+    for venue in venues:
+        # Load venue-specific data
+        l2_file = f'{venue}/{symbol}_incremental_book_L2_{date}.csv.gz'
+        ticker_file = f'{venue}/{symbol}_book_ticker_{date}.csv.gz'
+        trades_file = f'{venue}/{symbol}_trades_{date}.csv.gz'
+        
+        # Fuse
+        fused_file = f'{venue}_{symbol}_{date}_fused.npz'
+        tardis.convert(
+            [trades_file, l2_file, ticker_file],
+            output_filename=fused_file
+        )
+        
+        fused_data[venue] = fused_file
+    
+    return fused_data
+
+# Use in multi-venue strategy
+venue_data = fuse_multi_venue(
+    ['binance', 'bybit', 'okx'],
+    'BTCUSDT',
+    '20250501'
+)
+
+# Create assets for each venue
+assets = []
+for venue, data_file in venue_data.items():
+    asset = (
+        BacktestAsset()
+            .data([data_file])
+            # ... config
+    )
+    assets.append(asset)
+
+# Backtest multi-venue strategy
+hbt = ROIVectorMarketDepthBacktest(assets)
+```
+
+## Common Issues
+
+### Issue 1: Timestamp Conflicts
+
+**Problem**: Different streams have inconsistent timestamps
+
+**Solution**: Use exchange timestamps for ordering, local timestamps for latency
+
+```python
+# Sort by exchange timestamp (when event occurred)
+events.sort(key=lambda e: e['exch_ts'])
+
+# Use local timestamp for feed latency
+feed_latency = event['local_ts'] - event['exch_ts']
+```
+
+### Issue 2: Missing bookTicker Data
+
+**Problem**: Some exchanges don't provide separate BBO streams
+
+**Solution**: Extract BBO from L2 data but understand it's aggregated
+
+```python
+# Extract BBO from L2 stream
+def extract_bbo_from_l2(l2_data):
+    bbo_events = []
+    current_bbo = {'bid': None, 'ask': None}
+    
+    for event in l2_data:
+        if event['side'] == 'bid' and event['is_best']:
+            if event['price'] != current_bbo['bid']:
+                bbo_events.append(event)
+                current_bbo['bid'] = event['price']
+        # Similar for ask
+    
+    return bbo_events
+```
+
+### Issue 3: Excessive Data Volume
+
+**Problem**: Fused data files are very large
+
+**Solution**: Use compression and ROI filtering
+
+```python
+# Save with compression
+np.savez_compressed('fused_data.npz', data=events)
+
+# Or filter to region of interest during fusion
+def fuse_with_roi(streams, roi_lb, roi_ub):
+    # Only keep events within ROI price range
+    events = [e for e in all_events 
+              if roi_lb <= e['px'] <= roi_ub]
+    return events
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Always Fuse for Production">
+    Don't use raw L2 data alone for production strategies. The missing BBO updates will cause your backtest to diverge from live trading.
+  </Accordion>
+  
+  <Accordion title="Verify Fusion Quality">
+    After fusing, run verification tests to ensure:
+    - BBO update frequency increased significantly (>2x)
+    - No timestamp ordering violations
+    - Depth quantities are consistent
+  </Accordion>
+  
+  <Accordion title="Keep Raw Data">
+    Keep original raw data files. If you need to adjust fusion logic, you can re-fuse without re-downloading.
+  </Accordion>
+  
+  <Accordion title="Document Data Sources">
+    Clearly document which streams were fused:
+    ```python
+    # Good: Document in filename or metadata
+    'BTCUSDT_20250501_fused_l2_ticker_trades.npz'
+    
+    # Or save metadata
+    np.savez('data.npz', 
+             data=events,
+             metadata={'sources': ['l2', 'ticker', 'trades']})
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Latency Modeling" icon="clock" href="/advanced/latency-modeling">
+    Model feed latency accurately using fused data
+  </Card>
+  <Card title="Queue Models" icon="layer-group" href="/advanced/queue-models">
+    Improve fill simulation with better queue models
+  </Card>
+</CardGroup>

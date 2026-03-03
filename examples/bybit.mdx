@@ -1,0 +1,365 @@
+---
+title: "Bybit Integration"
+description: "Connect and trade on Bybit with HftBacktest"
+---
+
+## Overview
+
+HftBacktest provides integration with Bybit's linear perpetual futures, supporting both backtesting and live trading with the same algorithm code. The Bybit connector is currently under active development.
+
+<Warning>
+  **Development Status**: Bybit support is under development. Use at your own risk and report any issues you encounter.
+</Warning>
+
+## Setup
+
+### 1. Build the Connector
+
+Build the connector from source:
+
+```bash
+cd hftbacktest
+cargo build --release --package connector
+```
+
+### 2. Configure Connection
+
+Create a Bybit configuration file:
+
+```toml bybit.toml
+# Mainnet:
+#  - Linear: wss://stream.bybit.com/v5/public/linear
+# Testnet:
+#  - Linear: wss://stream-testnet.bybit.com/v5/public/linear
+public_url = "wss://stream-testnet.bybit.com/v5/public/linear"
+
+# Mainnet: wss://stream.bybit.com/v5/private
+# Testnet: wss://stream-testnet.bybit.com/v5/private
+private_url = "wss://stream-testnet.bybit.com/v5/private"
+
+# Mainnet: wss://stream.bybit.com/v5/trade
+# Testnet: wss://stream-testnet.bybit.com/v5/trade
+trade_url = "wss://stream-testnet.bybit.com/v5/trade"
+
+# Mainnet: https://api.bybit.com
+# Testnet: https://api-testnet.bybit.com
+rest_url = "https://api-testnet.bybit.com"
+
+# Linear
+category = "linear"
+
+order_prefix = ""
+api_key = "YOUR_API_KEY"
+secret = "YOUR_SECRET_KEY"
+```
+
+<Info>
+  **Symbols must be uppercase** for Bybit (e.g., `BTCUSDT`, not `btcusdt`).
+</Info>
+
+### 3. Run the Connector
+
+Start the connector:
+
+```bash
+connector --name bybit-futures --connector bybit --config bybit.toml
+```
+
+## Data Conversion
+
+Bybit provides two conversion methods depending on your needs:
+
+### Method 1: Fused Multi-Level Depth
+
+Use `convert_fused` to combine multiple order book depth levels (1, 25, 50, 200, etc.) into a single market depth representation:
+
+```python
+from hftbacktest.data.utils import bybit
+
+# Fuse all depth levels for more accurate order book
+data = bybit.convert_fused(
+    input_filename="examples/bybit/btcusdt_20250926.gz",
+    tick_size=0.1,
+    lot_size=0.001,
+    output_filename="btcusdt_20250926.npz"
+)
+
+print(f"Loaded {len(data)} events from fused conversion")
+```
+
+**When to use:**
+- You have data with multiple depth levels
+- You want the most accurate order book reconstruction
+- You need to handle overlapping depth updates from different levels
+
+### Method 2: Single Depth Level
+
+Use `convert_depth` to process only a specific depth level:
+
+```python
+from hftbacktest.data.utils.bybit import BybitDepthLevel
+import bybit
+
+# Process only level 200 data
+data = bybit.convert_depth(
+    input_filename="examples/bybit/btcusdt_20250926.gz",
+    single_depth_level=BybitDepthLevel.LEVEL_200,
+    output_filename="btcusdt_20250926.npz"
+)
+
+print(f"Loaded {len(data)} events from single depth conversion")
+```
+
+**Available depth levels:**
+```python
+BybitDepthLevel.LEVEL_1     # Top of book
+BybitDepthLevel.LEVEL_25    # 25 levels
+BybitDepthLevel.LEVEL_50    # 50 levels (default)
+BybitDepthLevel.LEVEL_100   # 100 levels
+BybitDepthLevel.LEVEL_200   # 200 levels
+BybitDepthLevel.LEVEL_1000  # 1000 levels
+```
+
+**When to use:**
+- You only need one specific depth level
+- Your data contains a single depth level
+- You want faster processing
+
+### Feed Data Format
+
+Bybit feed format contains local timestamp followed by JSON:
+
+```text
+1758841137168651303 {"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1758841134603,"data":{"s":"BTCUSDT","b":[["109378.80","1.273"]],"a":[["109378.90","6.278"]],"u":14869255,"seq":457514742271},"cts":1758841134598}
+1758841138293664629 {"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":1758841135824,"data":[{"T":1758841135823,"s":"BTCUSDT","S":"Buy","v":"0.020","p":"109378.90","L":"ZeroPlusTick","i":"2a74ac78-691c-5b54-9dbe-5aafe8364627","BT":false,"RPI":false,"seq":457514743450}]}
+1758845432767124368 {"topic":"orderbook.50.BTCUSDT","type":"delta","ts":1758845431663,"data":{"s":"BTCUSDT","b":[["109147.80","1.687"],["109144.10","0.027"]],"a":[["109148.00","0"],["109154.30","0.076"]],"u":21111423,"seq":457538796406},"cts":1758845431662}
+```
+
+## Complete Example
+
+Here's a complete example using Bybit data:
+
+```python
+import numpy as np
+from numba import njit
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+from hftbacktest.data.utils import bybit
+from hftbacktest.data.utils.bybit import BybitDepthLevel
+
+@njit
+def market_making_algo(hbt):
+    while hbt.elapse(2.5e8) == 0:  # 250ms intervals
+        depth = hbt.depth(0)
+        
+        # Prints the best bid and ask
+        print(
+            'current_timestamp:', hbt.current_timestamp,
+            ', best_bid:', np.round(depth.best_bid, 1),
+            ', best_ask:', np.round(depth.best_ask, 1)
+        )
+    return True
+
+if __name__ == "__main__":
+    # Example 1: Using convert_fused for multi-level depth
+    data = bybit.convert_fused(
+        input_filename="examples/bybit/btcusdt_20250926.gz",
+        tick_size=0.1,
+        lot_size=0.001,
+    )
+    
+    print(f"Loaded {len(data)} events from fused conversion")
+    
+    # Example 2: Using convert_depth for single level
+    data_single = bybit.convert_depth(
+        input_filename="examples/bybit/btcusdt_20250926.gz",
+        single_depth_level=BybitDepthLevel.LEVEL_200
+    )
+    
+    print(f"Loaded {len(data_single)} events from single depth conversion")
+    
+    # Create backtest asset
+    asset = (
+        BacktestAsset()
+            .data(data)
+            .linear_asset(1.0)
+            .power_prob_queue_model(2.0)
+            .no_partial_fill_exchange()
+            .trading_value_fee_model(-0.00005, 0.0007)
+            .tick_size(0.1)
+            .lot_size(0.001)
+    )
+    
+    hbt = HashMapMarketDepthBacktest([asset])
+    market_making_algo(hbt)
+```
+
+## Live Trading (Rust)
+
+### Basic Live Bot
+
+```rust
+use hftbacktest::{
+    live::{
+        Instrument,
+        LiveBot,
+        LiveBotBuilder,
+        LoggingRecorder,
+        ipc::iceoryx::IceoryxUnifiedChannel,
+    },
+    prelude::{Bot, ErrorKind, HashMapMarketDepth},
+};
+use tracing::error;
+
+fn prepare_live() -> LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth> {
+    LiveBotBuilder::new()
+        .register(Instrument::new(
+            "bybit-futures",  // connector name
+            "BTCUSDT",        // symbol (uppercase!)
+            0.1,              // tick_size
+            0.001,            // lot_size
+            HashMapMarketDepth::new(0.1, 0.001),
+            0,
+        ))
+        .error_handler(|error| {
+            match error.kind {
+                ErrorKind::ConnectionInterrupted => {
+                    error!("ConnectionInterrupted");
+                }
+                ErrorKind::CriticalConnectionError => {
+                    error!("CriticalConnectionError");
+                }
+                ErrorKind::OrderError => {
+                    let error = error.value();
+                    error!(?error, "OrderError");
+                }
+                ErrorKind::Custom(errno) => {
+                    error!(%errno, "custom");
+                }
+            }
+            Ok(())
+        })
+        .build()
+        .unwrap()
+}
+
+fn main() {
+    tracing_subscriber::fmt::init();
+    
+    let mut hbt = prepare_live();
+    hbt.run().unwrap();
+    
+    // Grid trading parameters
+    let relative_half_spread = 0.0001;
+    let relative_grid_interval = 0.0001;
+    let grid_num = 2;
+    let min_grid_step = 0.1;  // tick size
+    let skew = relative_half_spread / grid_num as f64;
+    let order_qty = 0.001;
+    let max_position = grid_num as f64 * order_qty;
+    
+    let mut recorder = LoggingRecorder::new();
+    gridtrading(
+        &mut hbt,
+        &mut recorder,
+        relative_half_spread,
+        relative_grid_interval,
+        grid_num,
+        min_grid_step,
+        skew,
+        order_qty,
+        max_position,
+    )
+    .unwrap();
+    
+    hbt.close().unwrap();
+}
+```
+
+## Comparison: Fused vs Single Depth
+
+<Tabs>
+  <Tab title="Fused Multi-Level">
+    **Advantages:**
+    - More accurate order book representation
+    - Combines all depth levels intelligently
+    - Better for strategies requiring full depth visibility
+    
+    **Disadvantages:**
+    - More processing overhead
+    - Requires tick_size and lot_size parameters
+    - Larger resulting dataset
+    
+    **Best for:**
+    - Market making strategies
+    - Strategies analyzing order book depth
+    - When you have multi-level depth data
+  </Tab>
+  
+  <Tab title="Single Depth Level">
+    **Advantages:**
+    - Faster processing
+    - Simpler configuration
+    - Smaller resulting dataset
+    
+    **Disadvantages:**
+    - Only processes one depth level
+    - May miss depth information from other levels
+    
+    **Best for:**
+    - Strategies using specific depth level
+    - When you only have one depth level
+    - Faster prototyping and testing
+  </Tab>
+</Tabs>
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Choose the Right Depth Level" icon="layer-group">
+    Select depth level based on your strategy:
+    - **LEVEL_1**: For tick-by-tick trading
+    - **LEVEL_50**: Good balance for most strategies
+    - **LEVEL_200+**: For deep order book analysis
+  </Card>
+  
+  <Card title="Test Thoroughly" icon="flask">
+    Bybit integration is under development:
+    - Start with testnet
+    - Test with small positions
+    - Report issues on GitHub
+  </Card>
+  
+  <Card title="Handle Depth Updates" icon="arrows-rotate">
+    Bybit sends snapshot and delta updates:
+    - Snapshots rebuild the book
+    - Deltas update incrementally
+    - The converter handles both automatically
+  </Card>
+  
+  <Card title="Symbol Format" icon="text">
+    Always use uppercase symbols for Bybit:
+    - ✅ `BTCUSDT`
+    - ❌ `btcusdt`
+  </Card>
+</CardGroup>
+
+## Fee Structure
+
+Bybit Linear Perpetual fee structure:
+
+| Account Type | Maker Fee | Taker Fee |
+|--------------|-----------|------------|
+| Standard | 0.0200% | 0.0550% |
+| Professional | 0.0150% | 0.0450% |
+| **Market Maker** | **-0.0050%** | **0.0700%** |
+
+<Tip>
+  Use `.trading_value_fee_model(-0.00005, 0.0007)` to model market maker rebates in your backtests.
+</Tip>
+
+## Resources
+
+- [Bybit V5 API Documentation](https://bybit-exchange.github.io/docs/v5/intro)
+- [WebSocket Public Topics](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook)
+- [Example: Bybit Live Trading](https://github.com/nkaz001/hftbacktest/blob/master/hftbacktest/examples/gridtrading_live_bybit.rs)
+- [GitHub Issues](https://github.com/nkaz001/hftbacktest/issues) - Report problems here

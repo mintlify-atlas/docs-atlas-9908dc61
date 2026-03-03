@@ -1,0 +1,281 @@
+---
+title: Installation
+description: Install HftBacktest for Python or Rust development
+---
+
+# Installation
+
+HftBacktest is available for both Python and Rust. Choose the installation method that matches your preferred development environment.
+
+## Python Installation
+
+### Requirements
+
+<Note>
+HftBacktest requires **Python 3.11 or higher**
+</Note>
+
+The Python package has the following dependencies:
+- `numpy >= 2.0, < 2.3`
+- `numba ~= 0.61`
+- `polars`
+- `matplotlib`
+- `holoviews`
+
+### Install via pip
+
+<Steps>
+  <Step title="Install the package">
+    The simplest way to install HftBacktest is using pip:
+
+    ```bash
+    pip install hftbacktest
+    ```
+
+    This will install the latest stable release from PyPI.
+  </Step>
+
+  <Step title="Verify installation">
+    Test your installation by importing the package:
+
+    ```python
+    import hftbacktest
+    print(hftbacktest.__version__)
+    ```
+  </Step>
+</Steps>
+
+### Install from Source
+
+For the latest development version, you can install directly from the GitHub repository:
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/nkaz001/hftbacktest
+    cd hftbacktest/py-hftbacktest
+    ```
+  </Step>
+
+  <Step title="Install with pip">
+    ```bash
+    pip install -e .
+    ```
+
+    The `-e` flag installs the package in editable mode, useful for development.
+  </Step>
+</Steps>
+
+### Optional Dependencies
+
+For additional data source support, install the optional dependencies:
+
+```bash
+# Databento data support
+pip install hftbacktest[databento]
+```
+
+## Rust Installation
+
+### Requirements
+
+<Note>
+HftBacktest requires **Rust 1.91.1 or higher**
+</Note>
+
+### Add to Cargo.toml
+
+Add HftBacktest as a dependency in your `Cargo.toml`:
+
+<CodeGroup>
+```toml Default Features
+[dependencies]
+hftbacktest = "0.9.4"
+```
+
+```toml Backtest Only
+[dependencies]
+hftbacktest = { version = "0.9.4", default-features = false, features = ["backtest"] }
+```
+
+```toml Live Trading
+[dependencies]
+hftbacktest = { version = "0.9.4", features = ["backtest", "live"] }
+```
+
+```toml S3 Support
+[dependencies]
+hftbacktest = { version = "0.9.4", features = ["backtest", "s3"] }
+```
+</CodeGroup>
+
+### Feature Flags
+
+The Rust crate provides several optional features:
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| `backtest` | Backtesting engine and data processing | ✓ |
+| `live` | Live trading bot support (Binance, Bybit) | ✓ |
+| `s3` | AWS S3 data loading support | ✗ |
+
+### Build Your Project
+
+After adding the dependency, build your project:
+
+```bash
+cargo build --release
+```
+
+<Tip>
+Always use `--release` mode for backtesting to get optimal performance. Debug builds can be 10-100x slower.
+</Tip>
+
+### Verify Installation
+
+Create a simple test to verify the installation:
+
+```rust
+use hftbacktest::prelude::*;
+
+fn main() {
+    println!("HftBacktest installed successfully!");
+}
+```
+
+Run it with:
+
+```bash
+cargo run --release
+```
+
+## Development Setup
+
+For contributing or development purposes:
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/nkaz001/hftbacktest
+    cd hftbacktest
+    ```
+  </Step>
+
+  <Step title="Python development">
+    Install Python package in development mode:
+
+    ```bash
+    cd py-hftbacktest
+    pip install -e .
+    ```
+  </Step>
+
+  <Step title="Rust development">
+    Build the Rust crate:
+
+    ```bash
+    cd hftbacktest
+    cargo build --release
+    ```
+  </Step>
+</Steps>
+
+## Platform-Specific Notes
+
+### Linux
+
+All features work out of the box on Linux. For optimal performance:
+
+```bash
+# Install build essentials if not present
+sudo apt-get update
+sudo apt-get install build-essential
+```
+
+### macOS
+
+Python and Rust installations work normally on macOS:
+
+```bash
+# Install Rust if needed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### Windows
+
+Both Python and Rust are supported on Windows:
+
+<Note>
+For Rust on Windows, you may need to install the [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+</Note>
+
+### ARM Architecture
+
+For ARM platforms (including Apple Silicon):
+
+```bash
+# Additional dependency is handled automatically
+# aws-lc-rs is used with bindgen feature
+```
+
+## Next Steps
+
+Now that you have HftBacktest installed, you're ready to run your first backtest:
+
+<CardGroup cols={2}>
+  <Card
+    title="Quick Start"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Run your first backtest with a simple example
+  </Card>
+  <Card
+    title="Data Preparation"
+    icon="database"
+    href="/guides/data-preparation"
+  >
+    Learn how to prepare market data for backtesting
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Python: NumPy version conflicts">
+    HftBacktest requires NumPy 2.0+. If you have conflicts:
+
+    ```bash
+    pip install --upgrade numpy
+    pip install --force-reinstall hftbacktest
+    ```
+  </Accordion>
+
+  <Accordion title="Python: Numba compilation errors">
+    Ensure you have the correct Numba version:
+
+    ```bash
+    pip install numba~=0.61
+    ```
+  </Accordion>
+
+  <Accordion title="Rust: Compilation takes too long">
+    The first build can take several minutes. Subsequent builds are faster. Use `cargo build --release -j 4` to limit parallel jobs if you have memory constraints.
+  </Accordion>
+
+  <Accordion title="Rust: Missing OpenSSL">
+    On Linux, install OpenSSL development libraries:
+
+    ```bash
+    sudo apt-get install libssl-dev pkg-config
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Getting Help
+
+If you encounter issues:
+
+- Check the [GitHub Issues](https://github.com/nkaz001/hftbacktest/issues)
+- Read the [full documentation](https://hftbacktest.readthedocs.io/)
+- Ask questions in [GitHub Discussions](https://github.com/nkaz001/hftbacktest/discussions)

@@ -1,0 +1,473 @@
+---
+title: Grid Trading Implementation
+description: Implement high-frequency grid trading strategies with dynamic grid management
+---
+
+Grid trading is a strategy that places multiple limit orders at predetermined price intervals (grids) to profit from market volatility. HftBacktest enables you to implement and test sophisticated grid trading strategies with realistic simulation.
+
+## Grid Trading Basics
+
+A grid trading strategy:
+
+1. Places limit orders at fixed price intervals above and below the current price
+2. Profits from mean reversion as prices oscillate through the grid
+3. Manages position limits to control risk
+4. Dynamically updates the grid as the market moves
+
+<Note>
+Grid trading works best in ranging markets with high volatility but no strong trend.
+</Note>
+
+## Simple Grid Trading Example
+
+```python
+import numpy as np
+from numba import njit, uint64
+from numba.typed import Dict
+from hftbacktest import BUY, SELL, GTX, LIMIT
+
+@njit
+def grid_trading(hbt, recorder):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    # Grid parameters
+    grid_num = 20         # Number of grid levels on each side
+    max_position = 5.0    # Maximum position size
+    grid_interval = tick_size * 10   # Price interval between grids
+    half_spread = tick_size * 20     # Half spread from mid price
+    order_qty = 0.1       # Order quantity per grid
+    
+    # Run every 100ms
+    while hbt.elapse(100_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+        
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        # Align prices to grid
+        bid_price = np.floor((mid_price - half_spread) / grid_interval) * grid_interval
+        ask_price = np.ceil((mid_price + half_spread) / grid_interval) * grid_interval
+        
+        # Create new grid for buy orders
+        new_bid_orders = Dict.empty(np.uint64, np.float64)
+        if position < max_position and np.isfinite(bid_price):
+            for i in range(grid_num):
+                bid_price_tick = round(bid_price / tick_size)
+                new_bid_orders[uint64(bid_price_tick)] = bid_price
+                bid_price -= grid_interval
+        
+        # Create new grid for sell orders
+        new_ask_orders = Dict.empty(np.uint64, np.float64)
+        if position > -max_position and np.isfinite(ask_price):
+            for i in range(grid_num):
+                ask_price_tick = round(ask_price / tick_size)
+                new_ask_orders[uint64(ask_price_tick)] = ask_price
+                ask_price += grid_interval
+        
+        # Cancel orders not in new grid
+        order_values = orders.values()
+        while order_values.has_next():
+            order = order_values.get()
+            if order.cancellable:
+                if (order.side == BUY and order.order_id not in new_bid_orders) or \
+                   (order.side == SELL and order.order_id not in new_ask_orders):
+                    hbt.cancel(asset_no, order.order_id, False)
+        
+        # Submit new orders
+        for order_id, order_price in new_bid_orders.items():
+            if order_id not in orders:
+                hbt.submit_buy_order(
+                    asset_no,
+                    order_id,
+                    order_price,
+                    order_qty,
+                    GTX,
+                    LIMIT,
+                    False
+                )
+        
+        for order_id, order_price in new_ask_orders.items():
+            if order_id not in orders:
+                hbt.submit_sell_order(
+                    asset_no,
+                    order_id,
+                    order_price,
+                    order_qty,
+                    GTX,
+                    LIMIT,
+                    False
+                )
+        
+        recorder.record(hbt)
+    
+    return True
+```
+
+<Warning>
+Use price ticks as order IDs to ensure only one order exists at each price level.
+</Warning>
+
+## Grid Trading with Position Skewing
+
+Enhance risk-adjusted returns by skewing the grid based on position:
+
+```python
+@njit
+def grid_trading_with_skew(hbt, recorder, skew):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    grid_num = 20
+    max_position = 5.0
+    grid_interval = tick_size * 10
+    half_spread = tick_size * 20
+    order_qty = 0.1
+    
+    while hbt.elapse(100_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+        
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        # Apply position-based skewing
+        # When long, reservation price moves down (easier to sell)
+        # When short, reservation price moves up (easier to buy)
+        reservation_price = mid_price - skew * position
+        
+        # Align prices to grid around reservation price
+        bid_price = np.floor((reservation_price - half_spread) / grid_interval) * grid_interval
+        ask_price = np.ceil((reservation_price + half_spread) / grid_interval) * grid_interval
+        
+        # ... rest of grid logic similar to above
+```
+
+<Note>
+Skewing the grid based on position helps manage inventory risk and improves risk-adjusted returns.
+</Note>
+
+## GLFT Grid Trading
+
+Combine grid trading with the GLFT market making model for adaptive spreads:
+
+```python
+import numpy as np
+from numba import njit
+from hftbacktest import BUY_EVENT, SELL_EVENT
+
+@njit
+def compute_coeff(gamma, delta, A, k):
+    inv_k = 1.0 / k
+    c1 = (1.0 / (gamma * delta)) * np.log(1 + gamma * delta * inv_k)
+    c2 = np.sqrt(
+        (gamma / (2 * A * delta * k)) * 
+        ((1 + gamma * delta * inv_k) ** (k / (gamma * delta) + 1))
+    )
+    return c1, c2
+
+@njit
+def glft_grid_trading(hbt, recorder):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    # Arrays to track market data
+    arrival_depth = np.full(30_000_000, np.nan, np.float64)
+    mid_price_chg = np.full(30_000_000, np.nan, np.float64)
+    
+    t = 0
+    prev_mid_price_tick = np.nan
+    mid_price_tick = np.nan
+    
+    # GLFT model parameters
+    A = np.nan
+    k = np.nan
+    volatility = np.nan
+    gamma = 0.05
+    delta = 1.0
+    
+    # Grid parameters
+    grid_num = 20
+    max_position = 5.0
+    grid_interval = tick_size * 10
+    order_qty = 0.1
+    
+    while hbt.elapse(100_000_000) == 0:
+        # Record order arrival depth
+        if not np.isnan(mid_price_tick):
+            depth_val = -np.inf
+            for last_trade in hbt.last_trades(asset_no):
+                trade_price_tick = last_trade.px / tick_size
+                if last_trade.ev & BUY_EVENT == BUY_EVENT:
+                    depth_val = max(trade_price_tick - mid_price_tick, depth_val)
+                else:
+                    depth_val = max(mid_price_tick - trade_price_tick, depth_val)
+            arrival_depth[t] = depth_val
+        
+        hbt.clear_last_trades(asset_no)
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+        
+        best_bid_tick = depth.best_bid_tick
+        best_ask_tick = depth.best_ask_tick
+        
+        prev_mid_price_tick = mid_price_tick
+        mid_price_tick = (best_bid_tick + best_ask_tick) / 2.0
+        mid_price_chg[t] = mid_price_tick - prev_mid_price_tick
+        
+        # Update A, k, and volatility every 5 seconds
+        if t % 50 == 0 and t >= 6_000 - 1:
+            # Calibrate A and k from trading intensity
+            # ... (see GLFT example for full implementation)
+            
+            # Update volatility
+            volatility = np.nanstd(mid_price_chg[t + 1 - 6_000:t + 1]) * np.sqrt(10)
+        
+        # Calculate GLFT-based spread and skew
+        if np.isfinite(A) and np.isfinite(k) and np.isfinite(volatility):
+            c1, c2 = compute_coeff(gamma, delta, A, k)
+            half_spread_tick = c1 + (delta / 2.0) * c2 * volatility
+            skew = c2 * volatility
+        else:
+            half_spread_tick = 20.0
+            skew = 2.0
+        
+        # Apply skewing
+        reservation_price_tick = mid_price_tick - skew * position
+        
+        # Create grid around reservation price
+        bid_price_tick = reservation_price_tick - half_spread_tick
+        ask_price_tick = reservation_price_tick + half_spread_tick
+        
+        # ... implement grid logic
+        
+        t += 1
+    
+    return True
+```
+
+## Dynamic Grid Parameters
+
+### Volatility-Based Grid Interval
+
+```python
+@njit
+def adaptive_grid_interval(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    # Track price changes
+    price_changes = np.zeros(600)  # Last 600 periods
+    t = 0
+    
+    base_grid_interval = 10  # Base interval in ticks
+    
+    while hbt.elapse(100_000_000) == 0:
+        depth = hbt.depth(asset_no)
+        mid_price_tick = (depth.best_bid_tick + depth.best_ask_tick) / 2.0
+        
+        if t > 0:
+            price_changes[t % len(price_changes)] = mid_price_tick - prev_mid
+        
+        # Calculate volatility
+        if t >= len(price_changes):
+            vol = np.std(price_changes) * np.sqrt(10)
+            # Scale grid interval with volatility
+            grid_interval_ticks = base_grid_interval * (1.0 + vol)
+        else:
+            grid_interval_ticks = base_grid_interval
+        
+        grid_interval = grid_interval_ticks * tick_size
+        
+        prev_mid = mid_price_tick
+        t += 1
+        
+        # ... use adaptive grid_interval in grid creation
+```
+
+### Spread-Based Grid Width
+
+```python
+@njit
+def spread_adaptive_grid(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    
+    while hbt.elapse(100_000_000) == 0:
+        depth = hbt.depth(asset_no)
+        
+        spread = depth.best_ask - depth.best_bid
+        spread_ticks = spread / tick_size
+        
+        # Adjust half_spread based on market spread
+        # In tight markets, use wider quotes
+        # In wide markets, stay closer to market
+        if spread_ticks < 5:
+            half_spread_ticks = 20  # Wide quotes
+        elif spread_ticks < 10:
+            half_spread_ticks = 15
+        else:
+            half_spread_ticks = 10  # Tight quotes
+        
+        # ... use adaptive half_spread_ticks
+```
+
+## Complete Example with Backtesting
+
+```python
+import numpy as np
+from numba import njit, uint64
+from numba.typed import Dict
+from hftbacktest import (
+    BacktestAsset,
+    ROIVectorMarketDepthBacktest,
+    Recorder,
+    BUY,
+    SELL,
+    GTX,
+    LIMIT
+)
+from hftbacktest.stats import LinearAssetRecord
+
+@njit
+def grid_trading(hbt, recorder):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    grid_num = 20
+    max_position = 5
+    grid_interval = tick_size * 10
+    half_spread = tick_size * 20
+    order_qty = 0.1
+    
+    while hbt.elapse(100_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+        
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+        
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        bid_price = np.floor((mid_price - half_spread) / grid_interval) * grid_interval
+        ask_price = np.ceil((mid_price + half_spread) / grid_interval) * grid_interval
+        
+        new_bid_orders = Dict.empty(np.uint64, np.float64)
+        if position < max_position and np.isfinite(bid_price):
+            for i in range(grid_num):
+                bid_price_tick = round(bid_price / tick_size)
+                new_bid_orders[uint64(bid_price_tick)] = bid_price
+                bid_price -= grid_interval
+        
+        new_ask_orders = Dict.empty(np.uint64, np.float64)
+        if position > -max_position and np.isfinite(ask_price):
+            for i in range(grid_num):
+                ask_price_tick = round(ask_price / tick_size)
+                new_ask_orders[uint64(ask_price_tick)] = ask_price
+                ask_price += grid_interval
+        
+        order_values = orders.values()
+        while order_values.has_next():
+            order = order_values.get()
+            if order.cancellable:
+                if (order.side == BUY and order.order_id not in new_bid_orders) or \
+                   (order.side == SELL and order.order_id not in new_ask_orders):
+                    hbt.cancel(asset_no, order.order_id, False)
+        
+        for order_id, order_price in new_bid_orders.items():
+            if order_id not in orders:
+                hbt.submit_buy_order(asset_no, order_id, order_price, order_qty, GTX, LIMIT, False)
+        
+        for order_id, order_price in new_ask_orders.items():
+            if order_id not in orders:
+                hbt.submit_sell_order(asset_no, order_id, order_price, order_qty, GTX, LIMIT, False)
+        
+        recorder.record(hbt)
+    
+    return True
+
+# Setup backtest
+asset = (
+    BacktestAsset()
+        .data([
+            'data/ethusdt_20221003.npz',
+            'data/ethusdt_20221004.npz',
+            'data/ethusdt_20221005.npz'
+        ])
+        .initial_snapshot('data/ethusdt_20221002_eod.npz')
+        .linear_asset(1.0)
+        .intp_order_latency(['latency/feed_latency_20221003.npz'])
+        .power_prob_queue_model(2.0)
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .tick_size(0.01)
+        .lot_size(0.001)
+        .roi_lb(0.0)
+        .roi_ub(3000.0)
+)
+
+hbt = ROIVectorMarketDepthBacktest([asset])
+recorder = Recorder(1, 5_000_000)
+
+# Run backtest
+grid_trading(hbt, recorder.recorder)
+_ = hbt.close()
+
+# Analyze results
+stats = LinearAssetRecord(recorder.get(0)).stats(book_size=10_000)
+print(stats.summary())
+stats.plot()
+```
+
+## Best Practices
+
+<Steps>
+
+### Choose Appropriate Grid Density
+
+Balance between:
+- More grids = more trading opportunities but higher management overhead
+- Fewer grids = simpler but may miss opportunities
+
+### Set Realistic Position Limits
+
+Avoid unlimited position accumulation:
+```python
+max_position = grid_num * order_qty  # Sensible default
+```
+
+### Monitor Grid Performance
+
+Track:
+- Fill rate at each grid level
+- Profit per grid level
+- Position distribution over time
+
+### Adjust for Market Regimes
+
+Consider:
+- Wider grids in low volatility
+- Tighter grids in high volatility
+- Pause in strong trends
+
+</Steps>
+
+## Next Steps
+
+- Learn about [Multi-Market Strategies](/guides/multi-market)
+- Explore [Live Trading Deployment](/guides/live-trading)
+- Read the [High-Frequency Grid Trading Tutorial](https://hftbacktest.readthedocs.io/en/latest/tutorials/High-Frequency%20Grid%20Trading.html)
+- See the [GLFT Grid Trading Tutorial](https://hftbacktest.readthedocs.io/en/latest/tutorials/GLFT%20Market%20Making%20Model%20and%20Grid%20Trading.html)

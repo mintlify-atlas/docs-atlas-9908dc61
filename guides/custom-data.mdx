@@ -1,0 +1,368 @@
+---
+title: Integrating Custom Data
+description: Combine custom data sources with market feeds to enhance your trading strategies
+---
+
+By combining your custom data with order book and trade feeds, you can enhance your strategies while leveraging HftBacktest's full simulation capabilities.
+
+## Overview
+
+Custom data integration allows you to:
+
+- Access correlated asset prices (e.g., spot prices for futures trading)
+- Incorporate external indicators (volatility indices, funding rates)
+- Use proprietary signals or research data
+- Combine multiple data sources in Point-in-Time fashion
+
+<Note>
+Custom data should come with a **local timestamp** and be merged in a time-aligned manner to avoid look-ahead bias.
+</Note>
+
+## Example: Accessing Spot Prices
+
+Let's combine spot BTCUSDT mid-price with USDM-Futures BTCUSDT feed data to estimate fair value pricing.
+
+### Step 1: Prepare Spot Data
+
+Process raw spot feed to extract timestamps and mid-prices:
+
+```python
+import numpy as np
+import gzip
+import json
+
+spot = np.full((100_000, 2), np.nan, np.float64)
+i = 0
+
+with gzip.open('spot/btcusdt_20240809.gz', 'r') as f:
+    while True:
+        line = f.readline()
+        if line is None or line == b'':
+            break
+
+        line = line.decode().strip()
+        local_timestamp = int(line[:19])
+
+        obj = json.loads(line[20:])
+        if obj['stream'] == 'btcusdt@bookTicker':
+            data = obj['data']
+            mid = (float(data['b']) + float(data['a'])) / 2.0
+            spot[i] = [local_timestamp, mid]
+            i += 1
+            
+spot = spot[:i]
+```
+
+<Note>
+The spot data has:
+- Column 0: Local timestamp (nanoseconds)
+- Column 1: Spot mid price
+</Note>
+
+### Step 2: Access Custom Data in Strategy
+
+Use Point-in-Time lookup to find the latest data before the current timestamp:
+
+```python
+from numba import njit
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+import numpy as np
+
+out_dtype = np.dtype([
+    ('timestamp', 'i8'),
+    ('mid_price', 'f8'),
+    ('spot_mid_price', 'f8')
+])
+
+@njit
+def calculate_basis(hbt, spot):
+    out = np.empty(1_000_000, out_dtype)
+    
+    asset_no = 0
+    t = 0
+    spot_row = 0
+    
+    # Check every 60 seconds
+    while hbt.elapse(60_000_000_000) == 0:
+        # Find the latest spot mid value (Point-in-Time)
+        while spot_row < len(spot) and spot[spot_row, 0] <= hbt.current_timestamp:
+            spot_row += 1
+        spot_mid_price = spot[spot_row - 1, 1] if spot_row > 0 else np.nan
+
+        depth = hbt.depth(asset_no)
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        basis = mid_price - spot_mid_price
+
+        out[t].timestamp = hbt.current_timestamp
+        out[t].mid_price = mid_price
+        out[t].spot_mid_price = spot_mid_price
+        t += 1
+        
+    return out[:t]
+```
+
+### Step 3: Run the Backtest
+
+```python
+asset = (
+    BacktestAsset()
+        .data(['usdm/btcusdt_20240809.npz'])
+        .initial_snapshot('usdm/btcusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .constant_latency(10_000_000, 10_000_000)
+        .risk_adverse_queue_model()
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(0.0002, 0.0007)
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+
+hbt = HashMapMarketDepthBacktest([asset])
+
+# Pass custom data to strategy
+out = calculate_basis(hbt, spot)
+
+_ = hbt.close()
+```
+
+## Point-in-Time Data Access
+
+The key principle is to always use data that was available at the current timestamp:
+
+```python
+@njit
+def point_in_time_lookup(hbt, custom_data):
+    """
+    custom_data: numpy array with shape (n, 2+)
+                 Column 0: timestamp
+                 Column 1+: data values
+    """
+    row = 0
+    
+    while hbt.elapse(1_000_000_000) == 0:
+        # Advance to latest data point before current time
+        while row < len(custom_data) and \
+              custom_data[row, 0] <= hbt.current_timestamp:
+            row += 1
+        
+        # Use the previous row (last available data)
+        if row > 0:
+            latest_value = custom_data[row - 1, 1]
+        else:
+            latest_value = np.nan
+        
+        # Use latest_value in your strategy
+        # ...
+```
+
+<Warning>
+Never use future data! Always ensure `custom_data[row, 0] <= hbt.current_timestamp`.
+</Warning>
+
+## Multiple Custom Data Sources
+
+You can combine multiple custom data sources:
+
+```python
+@njit
+def multi_source_strategy(hbt, spot_prices, volatility_index, funding_rates):
+    asset_no = 0
+    
+    spot_row = 0
+    vol_row = 0
+    funding_row = 0
+    
+    while hbt.elapse(1_000_000_000) == 0:
+        current_ts = hbt.current_timestamp
+        
+        # Update spot price
+        while spot_row < len(spot_prices) and \
+              spot_prices[spot_row, 0] <= current_ts:
+            spot_row += 1
+        spot = spot_prices[spot_row - 1, 1] if spot_row > 0 else np.nan
+        
+        # Update volatility
+        while vol_row < len(volatility_index) and \
+              volatility_index[vol_row, 0] <= current_ts:
+            vol_row += 1
+        vol = volatility_index[vol_row - 1, 1] if vol_row > 0 else np.nan
+        
+        # Update funding rate
+        while funding_row < len(funding_rates) and \
+              funding_rates[funding_row, 0] <= current_ts:
+            funding_row += 1
+        funding = funding_rates[funding_row - 1, 1] if funding_row > 0 else np.nan
+        
+        # Use all data sources in strategy
+        depth = hbt.depth(asset_no)
+        mid = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Calculate fair value with adjustments
+        fair_value = spot + funding_adjustment + vol_adjustment
+        # ...
+```
+
+## Custom Data Types
+
+<Tabs>
+  <Tab title="Price Data">
+    
+```python
+# Example: Spot prices, index prices, other market prices
+price_data = np.array([
+    [timestamp1, price1],
+    [timestamp2, price2],
+    # ...
+], dtype=np.float64)
+```
+
+  </Tab>
+  <Tab title="Indicator Data">
+    
+```python
+# Example: Volatility, momentum, custom indicators
+indicator_data = np.array([
+    [timestamp1, indicator_value1],
+    [timestamp2, indicator_value2],
+    # ...
+], dtype=np.float64)
+```
+
+  </Tab>
+  <Tab title="Multi-Column Data">
+    
+```python
+# Example: Multiple related values
+complex_data = np.array([
+    [timestamp1, value1_a, value1_b, value1_c],
+    [timestamp2, value2_a, value2_b, value2_c],
+    # ...
+], dtype=np.float64)
+```
+
+  </Tab>
+</Tabs>
+
+## Data Preparation Tips
+
+<Steps>
+
+### Ensure Timestamp Alignment
+
+Custom data timestamps must be in nanoseconds and represent when the data became available locally.
+
+### Sort by Timestamp
+
+Always sort your custom data by timestamp in ascending order:
+
+```python
+data = data[np.argsort(data[:, 0])]
+```
+
+### Handle Missing Data
+
+Use `np.nan` for missing values and handle them appropriately:
+
+```python
+if np.isfinite(custom_value):
+    # Use the value
+    pass
+else:
+    # Handle missing data
+    pass
+```
+
+### Pre-allocate Arrays
+
+For performance in Numba functions, pre-allocate arrays:
+
+```python
+max_rows = 1_000_000
+data = np.full((max_rows, 2), np.nan, dtype=np.float64)
+```
+
+</Steps>
+
+## Complete Example: Basis Trading
+
+```python
+import numpy as np
+from numba import njit
+from hftbacktest import (
+    BacktestAsset,
+    HashMapMarketDepthBacktest,
+    GTX,
+    LIMIT,
+    BUY,
+    SELL
+)
+
+@njit
+def basis_trading_strategy(hbt, spot_prices):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    lot_size = hbt.depth(asset_no).lot_size
+    
+    spot_row = 0
+    order_qty = 0.1
+    
+    while hbt.elapse(10_000_000_000) == 0:  # Every 10 seconds
+        # Get latest spot price
+        while spot_row < len(spot_prices) and \
+              spot_prices[spot_row, 0] <= hbt.current_timestamp:
+            spot_row += 1
+        spot = spot_prices[spot_row - 1, 1] if spot_row > 0 else np.nan
+        
+        if not np.isfinite(spot):
+            continue
+        
+        depth = hbt.depth(asset_no)
+        futures_mid = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Calculate basis
+        basis = futures_mid - spot
+        
+        # Simple basis trading logic
+        # If basis too high, short futures
+        # If basis too low, long futures
+        
+        target_basis = 10.0  # Expected basis
+        threshold = 5.0
+        
+        hbt.clear_inactive_orders(asset_no)
+        
+        if basis > target_basis + threshold:
+            # Basis too high - sell futures
+            price = depth.best_bid
+            price_tick = round(price / tick_size)
+            hbt.submit_sell_order(
+                asset_no,
+                price_tick,
+                price,
+                order_qty,
+                GTX,
+                LIMIT,
+                False
+            )
+        elif basis < target_basis - threshold:
+            # Basis too low - buy futures
+            price = depth.best_ask
+            price_tick = round(price / tick_size)
+            hbt.submit_buy_order(
+                asset_no,
+                price_tick,
+                price,
+                order_qty,
+                GTX,
+                LIMIT,
+                False
+            )
+    
+    return True
+```
+
+## Next Steps
+
+- Apply custom data to [Market Making](/guides/market-making)
+- Learn about [Multi-Market Trading](/guides/multi-market)
+- Explore [Grid Trading](/guides/grid-trading)

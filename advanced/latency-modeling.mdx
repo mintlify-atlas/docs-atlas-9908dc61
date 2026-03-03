@@ -1,0 +1,436 @@
+---
+title: 'Advanced Latency Modeling'
+description: 'Model feed latency and order latency accurately for realistic backtesting'
+---
+
+## Overview
+
+Latency modeling is critical for accurate high-frequency trading backtesting. There are two types of latency to model:
+
+1. **Feed Latency**: Time between when an event occurs at the exchange and when you receive it
+2. **Order Latency**: Time between when you send an order and when the exchange processes it (entry) and responds (response)
+
+Ignoring latency can lead to unrealistic backtests that assume you can react instantaneously to market events or that your orders are processed immediately.
+
+<Warning>
+Even microseconds of latency matter in HFT. A strategy that appears profitable with zero latency may lose money with realistic latency modeling.
+</Warning>
+
+## Types of Latency
+
+### Feed Latency
+
+Feed latency represents the time lag between market events and your observation of them:
+
+```python
+# Market event timeline
+Exchange Event Timestamp: T
+Your Receipt Timestamp:   T + feed_latency
+
+# Example: 500μs feed latency
+Exchange: Trade at 12:00:00.000000 (69000)
+Your View: Trade at 12:00:00.000500 (69000)
+```
+
+Feed latency is typically **already included** in your market data if you're using real feed data with local timestamps. HftBacktest uses the difference between `exch_ts` and `local_ts` fields.
+
+### Order Latency
+
+Order latency has two components:
+
+<Steps>
+  <Step title="Entry Latency">
+    Time from when you **send** an order to when the exchange **receives and processes** it
+    
+    ```python
+    Local Send Time:        T
+    Exchange Process Time:  T + entry_latency
+    ```
+  </Step>
+  
+  <Step title="Response Latency">
+    Time from when the exchange **processes** your order to when you **receive the response**
+    
+    ```python
+    Exchange Process Time:  T
+    Local Receipt Time:     T + response_latency
+    ```
+  </Step>
+</Steps>
+
+## Latency Models
+
+HftBacktest provides several latency models ranging from simple to sophisticated.
+
+### 1. Constant Latency
+
+The simplest model uses fixed latency values:
+
+```python
+from hftbacktest import BacktestAsset
+
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240101.npz'])
+        # entry_latency=1ms, response_latency=1ms  
+        .constant_latency(1_000_000, 1_000_000)
+)
+```
+
+<Info>
+**When to Use**:
+- Initial strategy development
+- When you know your latency is stable
+- Co-located trading with consistent networking
+- Quick parameter sweeps
+</Info>
+
+**Advantages**:
+- Simple to configure
+- Predictable behavior
+- Fast execution
+
+**Disadvantages**:
+- Doesn't capture latency variance
+- Misses congestion effects
+- Overly optimistic for internet-based trading
+
+### 2. Interpolated Historical Latency
+
+Use actual recorded latency data from your live trading:
+
+```python
+from hftbacktest.backtest import IntpOrderLatency, DataSource
+
+# Load historical order latency data
+latency_model = IntpOrderLatency(
+    data=[
+        DataSource.File('latency_20240101.npz'),
+        DataSource.File('latency_20240102.npz'),
+        DataSource.File('latency_20240103.npz'),
+    ],
+    latency_offset=0  # Adjust if needed
+)
+
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240101.npz'])
+        .order_latency(latency_model)
+)
+```
+
+#### Latency Data Format
+
+The latency data should contain these fields for each order:
+
+```python
+import numpy as np
+
+# Create latency data structure
+latency_data = np.array([
+    (req_ts1, exch_ts1, resp_ts1, 0),
+    (req_ts2, exch_ts2, resp_ts2, 0),
+    # ...
+], dtype=[
+    ('req_ts', 'i8'),    # Request timestamp (local)
+    ('exch_ts', 'i8'),   # Exchange process timestamp
+    ('resp_ts', 'i8'),   # Response timestamp (local)
+    ('_padding', 'i8'),  # Alignment padding
+])
+
+np.savez('latency_20240101.npz', data=latency_data)
+```
+
+#### How Interpolation Works
+
+The model interpolates between recorded latency values:
+
+```python
+# Given historical latency points:
+Point 1: req_ts=100, entry_lat=500μs
+Point 2: req_ts=200, entry_lat=600μs
+
+# At req_ts=150 (midpoint):
+interpolated_entry_lat = 550μs  # Linear interpolation
+```
+
+<Check>
+**Best Practices**:
+- Collect latency data during similar market conditions
+- Include data from high-volatility periods
+- Use data from the same time of day
+- Account for exchange maintenance windows
+</Check>
+
+### 3. Custom Latency Models
+
+Implement sophisticated models based on market conditions:
+
+```python
+from hftbacktest.backtest import LatencyModel
+from hftbacktest import Order
+
+class ConditionalLatencyModel(LatencyModel):
+    """Latency increases during high volatility"""
+    
+    def __init__(self, base_entry, base_response, volatility_data):
+        self.base_entry = base_entry
+        self.base_response = base_response
+        self.volatility_data = volatility_data
+        self.vol_index = 0
+    
+    def entry(self, timestamp: int, order: Order) -> int:
+        # Get current volatility
+        vol = self._get_volatility(timestamp)
+        
+        # Increase latency with volatility
+        # Higher vol = more orders = more congestion
+        vol_multiplier = 1.0 + vol * 2.0
+        
+        return int(self.base_entry * vol_multiplier)
+    
+    def response(self, timestamp: int, order: Order) -> int:
+        vol = self._get_volatility(timestamp)
+        vol_multiplier = 1.0 + vol * 1.5
+        return int(self.base_response * vol_multiplier)
+    
+    def _get_volatility(self, timestamp):
+        # Look up volatility at timestamp
+        while (self.vol_index < len(self.volatility_data) and 
+               self.volatility_data[self.vol_index]['ts'] <= timestamp):
+            self.vol_index += 1
+        if self.vol_index > 0:
+            return self.volatility_data[self.vol_index - 1]['vol']
+        return 0.0
+
+# Use custom model
+latency_model = ConditionalLatencyModel(
+    base_entry=500_000,      # 500μs base
+    base_response=500_000,   # 500μs base
+    volatility_data=vol_data
+)
+
+asset.order_latency(latency_model)
+```
+
+## Collecting Latency Data
+
+### Recording Live Order Latency
+
+When running live trading, record timestamps at each stage:
+
+```python
+import time
+import numpy as np
+
+class LatencyRecorder:
+    def __init__(self):
+        self.records = []
+    
+    def record_order(self, order_id):
+        """Record when order is sent"""
+        return {
+            'order_id': order_id,
+            'req_ts': time.time_ns(),
+            'exch_ts': None,
+            'resp_ts': None,
+        }
+    
+    def record_ack(self, order_id, exchange_timestamp, local_timestamp):
+        """Record exchange ack with timestamps"""
+        for rec in self.records:
+            if rec['order_id'] == order_id:
+                rec['exch_ts'] = exchange_timestamp
+                rec['resp_ts'] = local_timestamp
+                break
+    
+    def save(self, filename):
+        """Save to NPZ format"""
+        data = np.array(
+            [(r['req_ts'], r['exch_ts'], r['resp_ts'], 0) 
+             for r in self.records],
+            dtype=[('req_ts', 'i8'), ('exch_ts', 'i8'), 
+                   ('resp_ts', 'i8'), ('_padding', 'i8')]
+        )
+        np.savez(filename, data=data)
+```
+
+### Estimating from Feed Latency
+
+If you don't have order latency data, you can estimate from feed latency:
+
+```python
+import numpy as np
+
+def estimate_order_latency_from_feed(market_data_file):
+    """Estimate order latency from feed latency"""
+    data = np.load(market_data_file)['data']
+    
+    # Feed latency = local_ts - exch_ts
+    feed_latencies = data['local_ts'] - data['exch_ts']
+    
+    # Order latency is typically similar to feed latency
+    # But can be slightly higher due to order processing
+    mean_feed_lat = np.mean(feed_latencies)
+    std_feed_lat = np.std(feed_latencies)
+    
+    # Use feed latency + processing overhead
+    entry_latency = mean_feed_lat + 100_000  # +100μs processing
+    response_latency = mean_feed_lat + 50_000  # +50μs processing
+    
+    return entry_latency, response_latency
+```
+
+## Order Rejection Modeling
+
+Exchanges can reject orders during high load:
+
+```python
+# In IntpOrderLatency, negative latency indicates rejection
+# This happens when exch_timestamp is 0 or negative
+
+latency_data = np.array([
+    (1000, 1500, 2000, 0),    # Normal: entry=500, response=500
+    (2000, 0, 3000, 0),       # Rejected: entry=-1000 (rejection notification)
+    (3000, 3400, 3900, 0),    # Normal: entry=400, response=500
+], dtype=[...])
+```
+
+When entry latency is negative, the order is rejected:
+
+```python
+@njit
+def trading_algo(hbt):
+    # Submit order
+    order_id = hbt.submit_buy_order(...)
+    
+    # Wait for response
+    if hbt.wait_order_response(asset_no, order_id, timeout):
+        # Check if rejected
+        order = hbt.get_order(asset_no, order_id)
+        if order.status == Status.Rejected:
+            # Handle rejection
+            pass
+```
+
+## Impact Analysis
+
+Understand how latency affects your strategy:
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
+
+def analyze_latency_impact(strategy_func, data_files, latencies):
+    """Test strategy with different latency values"""
+    results = []
+    
+    for entry_lat, resp_lat in latencies:
+        asset = (
+            BacktestAsset()
+                .data(data_files)
+                .constant_latency(entry_lat, resp_lat)
+                # ... other config
+        )
+        
+        hbt = ROIVectorMarketDepthBacktest([asset])
+        recorder = Recorder(1, 10_000_000)
+        
+        strategy_func(hbt, recorder)
+        
+        record = LinearAssetRecord(recorder.get_records(0))
+        results.append({
+            'entry_latency': entry_lat / 1_000_000,  # Convert to ms
+            'response_latency': resp_lat / 1_000_000,
+            'sharpe': record.sharpe_ratio,
+            'total_pnl': record.total_pnl,
+        })
+    
+    return results
+
+# Test with increasing latencies
+latencies = [
+    (100_000, 100_000),    # 100μs
+    (500_000, 500_000),    # 500μs
+    (1_000_000, 1_000_000), # 1ms
+    (2_000_000, 2_000_000), # 2ms
+    (5_000_000, 5_000_000), # 5ms
+]
+
+results = analyze_latency_impact(my_strategy, data_files, latencies)
+
+# Plot impact
+plt.plot([r['entry_latency'] for r in results],
+         [r['sharpe'] for r in results])
+plt.xlabel('Latency (ms)')
+plt.ylabel('Sharpe Ratio')
+plt.title('Strategy Performance vs Latency')
+plt.show()
+```
+
+<Warning>
+**Common Findings**:
+- Most HFT strategies degrade rapidly after 1-2ms latency
+- Market making may tolerate up to 10ms
+- Arbitrage strategies are extremely latency-sensitive
+- Queue position strategies need sub-millisecond latency
+</Warning>
+
+## Latency Offset Adjustment
+
+You can adjust all latencies by a constant offset:
+
+```python
+# Add 100μs to all historical latencies
+latency_model = IntpOrderLatency(
+    data=[DataSource.File('latency_20240101.npz')],
+    latency_offset=100_000  # +100μs
+)
+
+# This is useful for:
+# - Testing sensitivity to latency
+# - Simulating network upgrades/downgrades
+# - Correcting clock skew in data
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Start Conservative">
+    Begin with higher latency estimates (1-2ms for crypto, 100-500μs for co-located) and gradually optimize. It's better to be pessimistic in backtesting than over-optimistic.
+  </Accordion>
+  
+  <Accordion title="Use Real Data When Possible">
+    Collect actual latency measurements from your production environment. Synthetic models cannot capture all real-world effects like network congestion, exchange load, and time-of-day patterns.
+  </Accordion>
+  
+  <Accordion title="Test Across Conditions">
+    Validate your latency model during:
+    - High volatility periods
+    - Market open/close
+    - Low liquidity hours
+    - Exchange maintenance windows
+  </Accordion>
+  
+  <Accordion title="Monitor Latency Drift">
+    Latency characteristics change over time due to:
+    - Exchange infrastructure updates
+    - Network routing changes
+    - Time-of-day patterns
+    - Market participant changes
+    
+    Regularly update your latency models with recent data.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Queue Models" icon="layer-group" href="/advanced/queue-models">
+    Understand order queue position modeling
+  </Card>
+  <Card title="Accelerated Backtesting" icon="rocket" href="/advanced/accelerated-backtesting">
+    Trade accuracy for speed in parameter optimization
+  </Card>
+</CardGroup>

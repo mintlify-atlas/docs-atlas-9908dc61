@@ -1,0 +1,207 @@
+---
+title: Queue-Based Market Making in Large Tick Size Assets
+description: Market making strategy that leverages queue position for large tick size assets
+---
+
+## Overview
+
+The significance of queue position is well-known in microstructure trading, particularly in assets with large tick sizes. This is because larger tick assets typically have more constrained price movements. The impact of tick size is discussed in detail in ["Large tick assets: implicit spread and optimal tick size"](https://arxiv.org/pdf/1207.6325).
+
+<Note>
+This example is for educational purposes only and demonstrates effective strategies for high-frequency market-making schemes. All backtests are based on a 0.005% rebate, the highest market maker rebate available on Binance Futures. See [Binance Upgrades USDⓢ-Margined Futures Liquidity Provider Program](https://www.binance.com/en/support/announcement/binance-updates-usd%E2%93%A2-margined-futures-liquidity-provider-program-2024-06-03-fefc6aa25e0947e2bf745c1c56bea13e) for more details.
+</Note>
+
+## Book Pressure
+
+We will review the [Market Microstructure signals described in this article](https://blog.headlandstech.com/2017/08/), which are similar to the concept of micro-price. Book imbalance is also addressed in [Market Making with Alpha - Order Book Imbalance](/examples/market-making-alpha).
+
+### Book Pressure Formula
+
+Book pressure is calculated as:
+
+$$
+\text{book pressure} = \frac{P_{best\ bid} \times Q_{best\ ask} + P_{best\ ask} \times Q_{best\ bid}}{Q_{best\ bid} + Q_{best\ ask}}
+$$
+
+This is essentially the VAMP (Volume Adjusted Mid Price) at the best bid and offer.
+
+## Implementation
+
+```python
+import numpy as np
+from numba import njit, uint64
+from numba.typed import Dict
+from hftbacktest import BUY, SELL, GTX, LIMIT
+
+@njit
+def mm_strategy(hbt, recorder):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    order_qty = 1
+    grid_num = 10
+    max_position = grid_num * order_qty
+    
+    # Half spread is just half a tick size
+    # Use 0.49 (slightly less than 0.5) to avoid round-off errors
+    # Lower values make orders stay at best bid/offer even with higher book pressure
+    # Think of it as a threshold for backing off based on book pressure
+    half_spread = tick_size * 0.49
+    grid_interval = tick_size
+    skew_adj = 1.0
+        
+    while hbt.elapse(100_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+
+        depth = hbt.depth(asset_no)
+        position = hbt.position(asset_no)
+        orders = hbt.orders(asset_no)
+
+        best_bid = depth.best_bid
+        best_ask = depth.best_ask
+
+        best_bid_qty = depth.bid_depth[depth.best_bid_tick]
+        best_ask_qty = depth.ask_depth[depth.best_ask_tick]
+
+        # Calculate book pressure (Market microstructure signal)
+        book_pressure = (best_bid * best_ask_qty + best_ask * best_bid_qty) / (best_bid_qty + best_ask_qty)
+        
+        skew = half_spread / grid_num * skew_adj
+        normalized_position = position / order_qty
+
+        # Reservation price with position-based skewing
+        # (Stoikov-Avellaneda market-making paper)
+        reservation_price = book_pressure - skew * normalized_position
+
+        # Limit price to best bid/ask to ensure market making
+        bid_price = np.minimum(reservation_price - half_spread, best_bid)
+        ask_price = np.maximum(reservation_price + half_spread, best_ask)
+
+        # Align prices to grid
+        bid_price = np.floor(bid_price / grid_interval) * grid_interval
+        ask_price = np.ceil(ask_price / grid_interval) * grid_interval
+        
+        # Create new bid orders grid
+        new_bid_orders = Dict.empty(np.uint64, np.float64)
+        if position < max_position and np.isfinite(bid_price):
+            for i in range(grid_num):
+                bid_price_tick = round(bid_price / tick_size)
+                new_bid_orders[uint64(bid_price_tick)] = bid_price
+                bid_price -= grid_interval
+
+        # Create new ask orders grid
+        new_ask_orders = Dict.empty(np.uint64, np.float64)
+        if position > -max_position and np.isfinite(ask_price):
+            for i in range(grid_num):
+                ask_price_tick = round(ask_price / tick_size)
+                new_ask_orders[uint64(ask_price_tick)] = ask_price
+                ask_price += grid_interval
+                
+        # Cancel orders not in new grid
+        order_values = orders.values();
+        while order_values.has_next():
+            order = order_values.get()
+            if order.cancellable:
+                if (
+                    (order.side == BUY and order.order_id not in new_bid_orders)
+                    or (order.side == SELL and order.order_id not in new_ask_orders)
+                ):
+                    hbt.cancel(asset_no, order.order_id, False)
+                    
+        # Submit new orders
+        for order_id, order_price in new_bid_orders.items():
+            if order_id not in orders:
+                hbt.submit_buy_order(asset_no, order_id, order_price, order_qty, GTX, LIMIT, False)
+                
+        for order_id, order_price in new_ask_orders.items():
+            if order_id not in orders:
+                hbt.submit_sell_order(asset_no, order_id, order_price, order_qty, GTX, LIMIT, False)
+        
+        recorder.record(hbt)
+    return True
+```
+
+## Key Concepts
+
+### Half Spread Parameter
+
+The `half_spread = tick_size * 0.49` parameter is crucial:
+
+- **0.49 instead of 0.5**: Avoids floating-point rounding issues
+- **Lower values**: Orders stay at best bid/offer more aggressively
+- **Higher values**: More conservative, backs off earlier when book pressure increases
+- **Acts as threshold**: Determines when to back off based on book pressure
+
+### Book Pressure vs Mid-Price
+
+Using book pressure instead of mid-price has several advantages:
+
+1. **Volume-weighted**: Accounts for queue depth at best bid/ask
+2. **Better fill probability**: Positions orders where execution is more likely
+3. **Queue position awareness**: Implicitly considers queue dynamics
+4. **Large tick assets**: Particularly effective where tick size is significant
+
+### Grid Configuration
+
+- **grid_num**: Number of price levels (10 in example)
+- **grid_interval**: Spacing between levels (1 tick size)
+- **max_position**: Maximum allowed position (grid_num × order_qty)
+- **skew_adj**: Adjustment factor for position-based skewing (1.0 = full skew)
+
+## Asset Configuration for Large Tick Size
+
+```python
+from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
+
+asset = (
+    BacktestAsset()
+        .data([f'data/CRVUSDT_{date}.npz' for date in range(20240701, 20240732)])
+        .linear_asset(1.0) 
+        .intp_order_latency([f'latency/feed_latency_{date}.npz' for date in range(20240701, 20240732)])
+        .power_prob_queue_model(3.0)  # Higher power for large tick assets
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .tick_size(0.001)  # Large tick size example
+        .lot_size(0.1)
+        .roi_lb(0.0)    
+        .roi_ub(2.0)
+        .last_trades_capacity(1000)
+)
+
+hbt = ROIVectorMarketDepthBacktest([asset])
+recorder = Recorder(1, 100_000_000)
+```
+
+## Performance Characteristics
+
+### Advantages
+
+- **Queue position priority**: Better execution probability
+- **Reduced adverse selection**: Book pressure signal helps avoid toxic flow
+- **Scalability**: Can handle multiple grids simultaneously
+- **Large tick optimization**: Particularly effective for constrained price movements
+
+### Key Metrics
+
+Typical performance for large tick size assets:
+- Lower number of trades compared to small tick assets
+- Higher fill rate per quote
+- More stable PnL due to queue position
+- Better performance with maker rebates
+
+## Best Practices
+
+1. **Calibrate half_spread**: Test different values (0.4-0.5) for your specific asset
+2. **Monitor queue position**: Track your position in the order book
+3. **Adjust skew_adj**: Fine-tune based on inventory risk tolerance
+4. **Use appropriate latency model**: `power_prob_queue_model` with power 3.0+ for large ticks
+5. **Consider rebates**: Strategy heavily dependent on maker rebate structure
+
+<Note>
+For large tick size assets, queue position is often more important than price optimization. The strategy should prioritize getting and maintaining good queue position over aggressive price improvement.
+</Note>
+
+## Related Topics
+
+- [Market Making with Alpha - Order Book Imbalance](/examples/market-making-alpha)
+- [High-Frequency Grid Trading](/examples/grid-trading)
+- [Queue Models](/advanced/queue-models)

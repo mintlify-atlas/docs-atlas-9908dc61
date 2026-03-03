@@ -1,0 +1,467 @@
+---
+title: 'Queue Position Models'
+description: 'Understand and customize queue position estimation for accurate fill simulation'
+---
+
+## Overview
+
+Queue position models estimate where your order sits in the order book queue at a given price level. This is crucial for accurate fill simulation because:
+
+- You only get filled when orders ahead of you are filled first
+- Orders can be canceled, improving your position
+- Your position determines when you're at the "front" and eligible for fills
+
+With Level-2 (Market-By-Price) data, you only see aggregated quantities at each price level, not individual orders. Queue models estimate your position within that aggregated quantity.
+
+<Info>
+With Level-3 (Market-By-Order) data, queue position is tracked exactly using FIFO rules, making queue models unnecessary. See [Level-3 Backtesting](/advanced/level3-backtesting) for details.
+</Info>
+
+## Why Queue Position Matters
+
+Consider this scenario:
+
+```
+Bid Price Level: $69,000
+Total Bid Quantity: 100 BTC
+Your Order: Buy 1 BTC @ $69,000
+
+Scenario A: You're at the front (queue position = 0)
+→ Next trade of any size fills you
+
+Scenario B: You're in the middle (queue position = 50 BTC)
+→ Need 50+ BTC to trade before you get filled
+
+Scenario C: You're at the back (queue position = 99 BTC)  
+→ Need 99+ BTC to trade before you get filled
+```
+
+Inaccurate queue position estimation leads to:
+- **Overestimating fills**: Assuming you're always at the front
+- **Incorrect alpha**: Strategy appears more profitable than reality
+- **Failed live trading**: Backtest diverges from live results
+
+## Available Queue Models
+
+HftBacktest provides several queue models with different accuracy/performance tradeoffs.
+
+### 1. Risk-Averse Queue Model
+
+The most conservative model - assumes you're always at the back of the queue:
+
+```python
+from hftbacktest import BacktestAsset
+
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240101.npz'])
+        .risk_adverse_queue_model()  # Conservative: you're always last
+)
+```
+
+**Queue Position Logic**:
+- When you submit an order, your queue position = total quantity at that price
+- Your position only improves when trades occur at your price
+- Quantity increases don't affect your position
+- Quantity decreases don't affect your position (conservative assumption)
+
+```python
+# Example:
+Initial: Bid qty = 100 BTC, your queue position = 100 BTC
+Trade:   10 BTC trade occurs
+→ Your queue position = 90 BTC (moved forward)
+
+Qty increases to 120 BTC (new orders behind you)
+→ Your queue position = 90 BTC (unchanged)
+
+Qty decreases to 80 BTC (cancellations, could be ahead or behind you)  
+→ Your queue position = 80 BTC (assume cancels were behind you)
+```
+
+<Warning>
+**Use Cases**:
+- Initial strategy development
+- Risk management and worst-case analysis
+- When you want to avoid overestimating fills
+
+**Limitations**:
+- May be too conservative, underestimating actual fills
+- Doesn't account for cancellations ahead of you
+- Can make profitable strategies appear unprofitable
+</Warning>
+
+### 2. Probability-Based Queue Model
+
+A more realistic model using probabilistic estimates:
+
+```python
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240101.npz'])
+        .prob_queue_model()  # Probability-based (default power=3)
+)
+```
+
+**Queue Position Logic**:
+
+1. **Initial Position**: When you join, position = current quantity at price level
+
+2. **Trade Occurs**: Your position moves forward by the trade quantity
+   ```
+   queue_position -= trade_quantity
+   ```
+
+3. **Quantity Decreases**: Cancellations improve your position based on probability
+   ```python
+   front_qty = queue_position
+   back_qty = total_qty - queue_position
+   
+   # Probability that cancellation is behind you
+   prob_behind = back / (back + front)
+   
+   # Expected queue advancement
+   qty_decrease = prev_qty - new_qty - trade_qty
+   advancement = (1 - prob_behind) * qty_decrease
+   
+   queue_position -= advancement
+   ```
+
+The probability function determines how likely cancellations are ahead vs behind you.
+
+### 3. Power Probability Queue Model
+
+Uses a power function to adjust the probability:
+
+```python
+# Power function: f(x) = x^n
+# Probability = f(back) / (f(back) + f(front))
+
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240101.npz'])
+        .power_prob_queue_model(3.0)  # n=3 (common default)
+)
+```
+
+**How the power parameter affects estimation**:
+
+<Tabs>
+  <Tab title="n = 1 (Linear)">
+    ```python
+    # Linear probability: prob = back / (back + front)
+    
+    # Example: front=25, back=75, total=100
+    prob_behind = 75 / (75 + 25) = 0.75
+    
+    # Interpretation: 
+    # - Cancellations equally likely anywhere in queue
+    # - Simple proportional model
+    ```
+  </Tab>
+  
+  <Tab title="n = 3 (Cubic)">
+    ```python
+    # Cubic probability: prob = back³ / (back³ + front³)
+    
+    # Example: front=25, back=75, total=100  
+    prob_behind = 75³ / (75³ + 25³) = 0.964
+    
+    # Interpretation:
+    # - Cancellations much more likely behind you
+    # - More optimistic about queue position
+    # - Common default that works well empirically
+    ```
+  </Tab>
+  
+  <Tab title="n = 5 (Higher Power)">
+    ```python
+    # Higher power: prob = back⁵ / (back⁵ + front⁵)
+    
+    # Example: front=25, back=75, total=100
+    prob_behind = 75⁵ / (75⁵ + 25⁵) = 0.997
+    
+    # Interpretation:
+    # - Cancellations almost always behind you
+    # - Very optimistic
+    # - May overestimate fills
+    ```
+  </Tab>
+</Tabs>
+
+<Info>
+**Choosing the power parameter**:
+- **n = 1-2**: Conservative, similar to risk-averse
+- **n = 3-4**: Balanced, works well for most markets
+- **n = 5+**: Optimistic, use when you know cancels are mostly behind you
+- **Calibrate by comparing backtest to live trading results**
+</Info>
+
+### 4. Logarithmic Probability Queue Model
+
+Uses logarithmic probability function:
+
+```python
+# Log function: f(x) = log(1 + x)
+# Probability = f(back) / (f(back) + f(front))
+
+asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240101.npz'])
+        .log_prob_queue_model()
+)
+```
+
+This model is more conservative than power models, especially when you're far from the front.
+
+## Calibrating Queue Models
+
+The best way to calibrate is by comparing backtest results with live trading:
+
+### Step 1: Run Live Trading
+
+Run your strategy live for a period and record:
+- All orders submitted
+- Fill rates at each price level
+- Time to fill
+- Partial vs full fills
+
+### Step 2: Backtest Same Period
+
+Backtest over the exact same time period with different queue models:
+
+```python
+import numpy as np
+from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
+from hftbacktest.stats import LinearAssetRecord
+
+def test_queue_models(strategy_func, data_files):
+    """Test different queue models"""
+    
+    models = [
+        ('Risk Averse', lambda a: a.risk_adverse_queue_model()),
+        ('Power n=1', lambda a: a.power_prob_queue_model(1.0)),
+        ('Power n=2', lambda a: a.power_prob_queue_model(2.0)),
+        ('Power n=3', lambda a: a.power_prob_queue_model(3.0)),
+        ('Power n=5', lambda a: a.power_prob_queue_model(5.0)),
+        ('Log', lambda a: a.log_prob_queue_model()),
+    ]
+    
+    results = []
+    for name, model_func in models:
+        asset = BacktestAsset().data(data_files)
+        model_func(asset)
+        # ... other config
+        
+        hbt = ROIVectorMarketDepthBacktest([asset])
+        recorder = Recorder(1, 10_000_000)
+        
+        strategy_func(hbt, recorder)
+        
+        record = LinearAssetRecord(recorder.get_records(0))
+        results.append({
+            'model': name,
+            'num_trades': record.num_trades,
+            'sharpe': record.sharpe_ratio,
+            'total_pnl': record.total_pnl,
+        })
+    
+    return results
+```
+
+### Step 3: Compare Metrics
+
+Compare key metrics between backtest and live:
+
+| Metric | Live Trading | Backtest (n=3) | Backtest (n=5) |
+|--------|--------------|----------------|----------------|
+| Fill Rate | 65% | 63% | 78% |
+| Avg Time to Fill | 2.3s | 2.5s | 1.8s |
+| Total Trades | 1,234 | 1,189 | 1,456 |
+| Sharpe Ratio | 2.1 | 2.0 | 2.4 |
+
+In this example, n=3 matches live results best, while n=5 is too optimistic.
+
+<Check>
+**Good Calibration Indicators**:
+- Fill rate within 5-10% of live
+- Trade count within 10% of live  
+- Similar time-to-fill distributions
+- PnL correlation > 0.9 between backtest and live
+</Check>
+
+## Market-Specific Considerations
+
+### Large Tick Size Markets
+
+Markets with large tick sizes (CME, some crypto pairs) make queue position critical:
+
+```python
+# Example: CME BTC futures (5 USD tick)
+# At 69,000, tick = 5 USD
+# Spread often at minimum (1 tick = 5 USD)
+
+asset = (
+    BacktestAsset()
+        .data(['cme_btc.npz'])
+        .tick_size(5.0)  # Large tick
+        .power_prob_queue_model(2.0)  # More conservative for large tick
+)
+```
+
+<Warning>
+In large tick markets:
+- Most trading happens at best bid/ask
+- Queue position determines if you get filled
+- Being 1 tick away means no fills
+- Use more conservative queue models (n=2-3)
+</Warning>
+
+### Small Tick Size Markets
+
+Markets with tiny tick sizes (most crypto) are more forgiving:
+
+```python
+# Example: Binance BTCUSDT (0.1 USD tick)
+# At 69,000, tick = 0.1 USD (~0.00014%)
+# Spread often multiple ticks
+
+asset = (
+    BacktestAsset()
+        .data(['binance_btcusdt.npz'])
+        .tick_size(0.1)  # Small tick
+        .power_prob_queue_model(3.0)  # Standard model works fine
+)
+```
+
+In small tick markets, queue position matters less because you can easily move in/out of the spread.
+
+## Custom Queue Models
+
+Implement your own queue model by subclassing `QueueModel`:
+
+```python
+from hftbacktest.backtest import QueueModel
+from hftbacktest import MarketDepth, Order
+
+class VolumeWeightedQueueModel(QueueModel):
+    """Adjust queue position based on recent volume"""
+    
+    def __init__(self, volume_data):
+        self.volume_data = volume_data
+        self.vol_index = 0
+    
+    def new_order(self, order: Order, depth: MarketDepth):
+        """Initialize queue position when order is accepted"""
+        if order.side == Side.Buy:
+            front_qty = depth.bid_qty_at_tick(order.price_tick)
+        else:
+            front_qty = depth.ask_qty_at_tick(order.price_tick)
+        
+        # Store queue position and cumulative trade quantity
+        order.q = {'front': front_qty, 'cum_trade': 0.0}
+    
+    def trade(self, order: Order, qty: float, depth: MarketDepth):
+        """Adjust position when trade occurs at same price"""
+        order.q['front'] -= qty
+        order.q['cum_trade'] += qty
+    
+    def depth(self, order: Order, prev_qty: float, new_qty: float, 
+              depth: MarketDepth):
+        """Adjust position when depth changes"""
+        # Get current volume rate
+        vol_rate = self._get_volume_rate(depth.timestamp)
+        
+        # Adjust probability based on volume
+        # High volume = more aggressive traders = more cancels behind you
+        base_prob = 0.5
+        vol_adjustment = min(vol_rate / 1000.0, 0.3)  # Cap at +30%
+        prob_behind = base_prob + vol_adjustment
+        
+        # Calculate quantity change
+        chg = prev_qty - new_qty - order.q['cum_trade']
+        order.q['cum_trade'] = 0.0
+        
+        if chg < 0:  # Quantity increased
+            order.q['front'] = min(order.q['front'], new_qty)
+        else:  # Quantity decreased
+            front = order.q['front']
+            advancement = (1.0 - prob_behind) * chg
+            order.q['front'] = max(0, front - advancement)
+    
+    def is_filled(self, order: Order, depth: MarketDepth) -> float:
+        """Check if order should be filled"""
+        if order.q['front'] <= 0:
+            # At front of queue - fill the order
+            order.q['front'] = 0
+            return order.leaves_qty
+        return 0.0  # Not filled yet
+    
+    def _get_volume_rate(self, timestamp):
+        # Look up volume data
+        # ... implementation ...
+        pass
+```
+
+## Debugging Queue Position
+
+Track queue position throughout the backtest:
+
+```python
+from numba import njit
+
+@njit
+def debug_queue_position(hbt):
+    asset_no = 0
+    
+    while hbt.elapse(100_000_000) == 0:
+        orders = hbt.orders(asset_no)
+        order_values = orders.values()
+        
+        while order_values.has_next():
+            order = order_values.get()
+            
+            # Access queue position (stored in order.q)
+            # For prob queue model, order.q contains QueuePos struct
+            print(f"Order {order.order_id}:")
+            print(f"  Price: {order.price}")
+            print(f"  Side: {'BUY' if order.side == BUY else 'SELL'}")
+            # Note: Direct access to order.q internals requires
+            # understanding the specific queue model's data structure
+        
+        hbt.clear_inactive_orders(asset_no)
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Start Conservative">
+    Begin with risk-averse or low-power models (n=1-2). Gradually increase optimism only after validating with live trading.
+  </Accordion>
+  
+  <Accordion title="Validate with Live Data">
+    The only way to know if your queue model is accurate is to compare backtest results with actual live trading over the same period.
+  </Accordion>
+  
+  <Accordion title="Consider Market Microstructure">
+    Different markets have different cancellation patterns:
+    - HFT-heavy markets: More cancellations, often behind you
+    - Retail markets: Fewer cancellations, more random
+    - Large tick markets: Queue position critical
+    - Small tick markets: Less sensitive to queue model
+  </Accordion>
+  
+  <Accordion title="Monitor Over Time">
+    Market microstructure changes. Recalibrate your queue model periodically by comparing recent backtests with live results.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Level-3 Backtesting" icon="layer-group" href="/advanced/level3-backtesting">
+    Perfect queue tracking with Market-By-Order data
+  </Card>
+  <Card title="Latency Modeling" icon="clock" href="/advanced/latency-modeling">
+    Model realistic order latencies
+  </Card>
+</CardGroup>

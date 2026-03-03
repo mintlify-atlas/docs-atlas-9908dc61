@@ -1,0 +1,595 @@
+---
+title: Multi-Asset Backtesting
+description: Backtesting strategies across multiple assets and exchanges simultaneously
+---
+
+## Overview
+
+HftBacktest supports backtesting strategies that trade multiple assets simultaneously. This enables:
+
+- Multi-asset market making
+- Cross-exchange arbitrage
+- Pairs trading and statistical arbitrage  
+- Portfolio strategies
+- Spread trading (futures calendar spreads, etc.)
+
+Each asset can have different configurations for latency, fees, queue models, and market depth implementations.
+
+## Multi-Asset Architecture
+
+The `Backtest` struct from `backtest/mod.rs:604-1140` manages multiple assets:
+
+```rust
+pub struct Backtest<MD> {
+    cur_ts: i64,
+    evs: EventSet,  // Coordinates events across all assets
+    local: Vec<BacktestProcessorState<Box<dyn LocalProcessor<MD>>>>,
+    exch: Vec<BacktestProcessorState<Box<dyn Processor>>>,
+}
+```
+
+Key components:
+
+<CardGroup cols={2}>
+  <Card title="EventSet" icon="calendar">
+    Maintains event timestamps for all assets and determines which event to process next across the entire portfolio.
+  </Card>
+  
+  <Card title="Per-Asset Processors" icon="microchip">
+    Each asset has its own local and exchange processors with independent:
+    - Order books
+    - Order states
+    - Latency models
+    - Queue models
+  </Card>
+  
+  <Card title="Unified Timeline" icon="clock">
+    All assets share the same simulation clock (`cur_ts`), ensuring proper chronological event ordering.
+  </Card>
+  
+  <Card title="Independent Configuration" icon="sliders">
+    Each asset can use different tick sizes, lot sizes, fee structures, and market depth implementations.
+  </Card>
+</CardGroup>
+
+## Creating Multi-Asset Backtests
+
+### Python API
+
+```python
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+
+# Configure asset 1
+asset_btc = (
+    BacktestAsset()
+        .data(['data/btcusdt_20220901.npz'])
+        .initial_snapshot('data/btcusdt_20220831_eod.npz')
+        .linear_asset(1.0)
+        .intp_order_latency(['latency/btc_latency_20220901.npz'])
+        .power_prob_queue_model(3.0)
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .tick_size(0.1)
+        .lot_size(0.001)
+)
+
+# Configure asset 2  
+asset_eth = (
+    BacktestAsset()
+        .data(['data/ethusdt_20220901.npz'])
+        .initial_snapshot('data/ethusdt_20220831_eod.npz')
+        .linear_asset(1.0)
+        .intp_order_latency(['latency/eth_latency_20220901.npz'])
+        .power_prob_queue_model(3.0)
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .tick_size(0.01)
+        .lot_size(0.001)
+)
+
+# Create multi-asset backtest
+hbt = HashMapMarketDepthBacktest([asset_btc, asset_eth])
+
+# Assets are indexed: 0 = BTC, 1 = ETH
+```
+
+### Rust API
+
+```rust
+use hftbacktest::{
+    backtest::{
+        Backtest, Asset, DataSource, ExchangeKind,
+        assettype::LinearAsset,
+        models::{ConstantLatency, ProbQueueModel, PowerProbQueueFunc3, TradingValueFeeModel, CommonFees},
+    },
+    depth::HashMapMarketDepth,
+};
+
+// Build asset 1
+let asset_btc = Asset::l2_builder()
+    .data(vec![DataSource::File("data/btcusdt.npz".to_string())])
+    .latency_model(ConstantLatency::new(500_000, 500_000))
+    .asset_type(LinearAsset::new(1.0))
+    .fee_model(TradingValueFeeModel::new(CommonFees::new(-0.00005, 0.0007)))
+    .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+    .exchange(ExchangeKind::NoPartialFillExchange)
+    .depth(|| HashMapMarketDepth::new(0.1, 0.001))
+    .build()?;
+
+// Build asset 2
+let asset_eth = Asset::l2_builder()
+    .data(vec![DataSource::File("data/ethusdt.npz".to_string())])
+    .latency_model(ConstantLatency::new(500_000, 500_000))
+    .asset_type(LinearAsset::new(1.0))
+    .fee_model(TradingValueFeeModel::new(CommonFees::new(-0.00005, 0.0007)))
+    .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+    .exchange(ExchangeKind::NoPartialFillExchange)
+    .depth(|| HashMapMarketDepth::new(0.01, 0.001))
+    .build()?;
+
+// Create backtest
+let mut backtest = Backtest::builder()
+    .add_asset(asset_btc)
+    .add_asset(asset_eth)
+    .build()?;
+```
+
+## Accessing Assets
+
+Access each asset by its index:
+
+```python
+@njit
+def multi_asset_strategy(hbt):
+    num_assets = hbt.num_assets()  # Returns 2
+    
+    # Access BTC (asset 0)
+    btc_depth = hbt.depth(0)
+    btc_position = hbt.position(0)
+    btc_orders = hbt.orders(0)
+    btc_mid = (btc_depth.best_bid + btc_depth.best_ask) / 2.0
+    
+    # Access ETH (asset 1)
+    eth_depth = hbt.depth(1)
+    eth_position = hbt.position(1)
+    eth_orders = hbt.orders(1)
+    eth_mid = (eth_depth.best_bid + eth_depth.best_ask) / 2.0
+    
+    # Cross-asset logic
+    btc_eth_ratio = btc_mid / eth_mid
+```
+
+## Event Coordination
+
+The `EventSet` from `backtest/evs.rs:24-106` coordinates events across assets:
+
+```rust
+impl EventSet {
+    pub fn new(num_assets: usize) -> Self {
+        // Allocates 4 event slots per asset:
+        // - LocalData (feed data received locally)
+        // - LocalOrder (order response received locally)
+        // - ExchData (event at exchange)
+        // - ExchOrder (order processed at exchange)
+        let mut timestamp = AlignedArray::new(num_assets * 4);
+        for i in 0..(num_assets * 4) {
+            timestamp[i] = i64::MAX;
+        }
+        Self { timestamp }
+    }
+    
+    pub fn next(&self) -> Option<EventIntent> {
+        // Find earliest timestamp across all assets
+        let mut evst_no = 0;
+        let mut timestamp = self.timestamp[0];
+        for (i, &ev_timestamp) in self.timestamp[1..].iter().enumerate() {
+            if ev_timestamp < timestamp {
+                timestamp = ev_timestamp;
+                evst_no = i + 1;
+            }
+        }
+        // Returns (timestamp, asset_no, event_kind)
+        // ...
+    }
+}
+```
+
+This ensures events are processed in true chronological order across all assets.
+
+## Multi-Asset Strategies
+
+### Pairs Trading
+
+```python
+@njit
+def pairs_trading_strategy(hbt):
+    btc_asset = 0
+    eth_asset = 1
+    
+    while hbt.elapse(10_000_000) == 0:  # Every 10ms
+        # Get mid prices
+        btc_depth = hbt.depth(btc_asset)
+        eth_depth = hbt.depth(eth_asset)
+        
+        btc_mid = (btc_depth.best_bid + btc_depth.best_ask) / 2.0
+        eth_mid = (eth_depth.best_bid + eth_depth.best_ask) / 2.0
+        
+        # Calculate ratio
+        ratio = btc_mid / eth_mid
+        
+        # Simple mean reversion on ratio
+        target_ratio = 15.0  # Historical mean
+        threshold = 0.05
+        
+        if ratio > target_ratio * (1 + threshold):
+            # Ratio too high: sell BTC, buy ETH
+            hbt.submit_sell_order(btc_asset, 1, btc_depth.best_bid, 0.01, GTX, LIMIT, False)
+            hbt.submit_buy_order(eth_asset, 2, eth_depth.best_ask, 0.1, GTX, LIMIT, False)
+        elif ratio < target_ratio * (1 - threshold):
+            # Ratio too low: buy BTC, sell ETH
+            hbt.submit_buy_order(btc_asset, 3, btc_depth.best_ask, 0.01, GTX, LIMIT, False)
+            hbt.submit_sell_order(eth_asset, 4, eth_depth.best_bid, 0.1, GTX, LIMIT, False)
+```
+
+### Cross-Exchange Arbitrage
+
+```python
+@njit
+def cross_exchange_arbitrage(hbt):
+    binance_btc = 0
+    bybit_btc = 1
+    
+    while hbt.elapse(1_000_000) == 0:  # Every 1ms (latency-sensitive)
+        binance_depth = hbt.depth(binance_btc)
+        bybit_depth = hbt.depth(bybit_btc)
+        
+        # Check for arbitrage opportunity
+        # Buy on Binance, sell on Bybit
+        if binance_depth.best_ask < bybit_depth.best_bid:
+            spread = bybit_depth.best_bid - binance_depth.best_ask
+            
+            # Account for fees (taker on both sides)
+            fee_cost = (binance_depth.best_ask + bybit_depth.best_bid) * 0.0004
+            
+            if spread > fee_cost:
+                qty = min(binance_depth.best_ask_qty, bybit_depth.best_bid_qty, 0.01)
+                
+                # Simultaneous orders
+                hbt.submit_buy_order(binance_btc, 100, binance_depth.best_ask, qty, GTX, MARKET, False)
+                hbt.submit_sell_order(bybit_btc, 101, bybit_depth.best_bid, qty, GTX, MARKET, False)
+        
+        # Check reverse opportunity
+        if bybit_depth.best_ask < binance_depth.best_bid:
+            # Buy on Bybit, sell on Binance
+            # ...
+```
+
+### Multi-Asset Market Making
+
+```python
+@njit
+def multi_asset_market_making(hbt):
+    num_assets = hbt.num_assets()
+    
+    while hbt.elapse(10_000_000) == 0:
+        for asset_no in range(num_assets):
+            hbt.clear_inactive_orders(asset_no)
+            
+            depth = hbt.depth(asset_no)
+            position = hbt.position(asset_no)
+            
+            # Per-asset market making logic
+            mid = (depth.best_bid + depth.best_ask) / 2.0
+            
+            # Skew based on position
+            skew = -position * 0.001
+            
+            bid_price = mid * (1 - 0.0005) + skew
+            ask_price = mid * (1 + 0.0005) + skew
+            
+            # Submit orders
+            bid_tick = int(bid_price / depth.tick_size)
+            ask_tick = int(ask_price / depth.tick_size)
+            
+            hbt.submit_buy_order(asset_no, bid_tick, bid_tick * depth.tick_size, 1.0, GTX, LIMIT, False)
+            hbt.submit_sell_order(asset_no, ask_tick, ask_tick * depth.tick_size, 1.0, GTX, LIMIT, False)
+```
+
+See [Making Multiple Markets](https://hftbacktest.readthedocs.io/en/latest/tutorials/Making%20Multiple%20Markets.html) tutorial.
+
+## Portfolio State
+
+Each asset maintains independent state:
+
+<Tabs>
+  <Tab title="Position">
+    ```python
+    # Per-asset positions
+    btc_position = hbt.position(0)
+    eth_position = hbt.position(1)
+    
+    # Total portfolio value (in quote currency)
+    btc_value = btc_position * btc_mid
+    eth_value = eth_position * eth_mid
+    total_value = btc_value + eth_value
+    ```
+  </Tab>
+  
+  <Tab title="Balance">
+    ```python
+    # Per-asset balance and PnL
+    btc_state = hbt.state_values(0)
+    eth_state = hbt.state_values(1)
+    
+    btc_balance = btc_state.balance
+    eth_balance = eth_state.balance
+    
+    total_balance = btc_balance + eth_balance
+    ```
+  </Tab>
+  
+  <Tab title="Orders">
+    ```python
+    # Per-asset order management
+    btc_orders = hbt.orders(0)
+    eth_orders = hbt.orders(1)
+    
+    # Count total active orders
+    total_orders = len(btc_orders) + len(eth_orders)
+    ```
+  </Tab>
+  
+  <Tab title="Fees">
+    ```python
+    # Per-asset fees
+    btc_state = hbt.state_values(0)
+    eth_state = hbt.state_values(1)
+    
+    btc_fee = btc_state.fee
+    eth_fee = eth_state.fee
+    
+    total_fee = btc_fee + eth_fee
+    ```
+  </Tab>
+</Tabs>
+
+## Cross-Exchange Configuration
+
+When backtesting across exchanges, configure exchange-specific parameters:
+
+<AccordionGroup>
+  <Accordion title="Different Latencies">
+    Each exchange has different latency characteristics:
+    
+    ```python
+    binance = (
+        BacktestAsset()
+            .constant_latency(500_000, 500_000)  # 0.5ms (better colocation)
+    )
+    
+    coinbase = (
+        BacktestAsset()
+            .constant_latency(2_000_000, 2_000_000)  # 2ms
+    )
+    ```
+  </Accordion>
+  
+  <Accordion title="Different Fee Structures">
+    Exchanges have different maker/taker fees:
+    
+    ```python
+    # Binance: -0.005% maker, 0.02% taker
+    binance = BacktestAsset().trading_value_fee_model(-0.00005, 0.0002)
+    
+    # Bybit: -0.01% maker, 0.06% taker  
+    bybit = BacktestAsset().trading_value_fee_model(-0.0001, 0.0006)
+    ```
+  </Accordion>
+  
+  <Accordion title="Different Tick/Lot Sizes">
+    Price and quantity increments vary:
+    
+    ```python
+    # BTC-USDT on Binance
+    binance_btc = BacktestAsset().tick_size(0.1).lot_size(0.001)
+    
+    # BTC-USD on Coinbase  
+    coinbase_btc = BacktestAsset().tick_size(0.01).lot_size(0.00001)
+    ```
+  </Accordion>
+  
+  <Accordion title="Different Queue Models">
+    Each exchange has unique matching behavior:
+    
+    ```python
+    # Binance: use calibrated probability model
+    binance = BacktestAsset().power_prob_queue_model(3.0)
+    
+    # Pro-rata exchange: use different model
+    # (Note: HftBacktest focuses on FIFO, pro-rata needs custom implementation)
+    prorata_exch = BacktestAsset().risk_adverse_queue_model()
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Latency Offset for Cross-Exchange
+
+When data is collected from one location but you're deploying elsewhere:
+
+```python
+# Data collected in Tokyo
+# Deploying in Singapore (5ms closer to exchange)
+
+asset = (
+    BacktestAsset()
+        .data(['tokyo_collected_data.npz'])
+        .latency_offset(-5_000_000)  # Reduce feed latency by 5ms
+        # ...
+)
+```
+
+From `backtest/mod.rs:188-194`:
+
+```rust
+pub fn latency_offset(self, latency_offset: i64) -> Self {
+    Self {
+        latency_offset,
+        ..self
+    }
+}
+```
+
+## Performance Considerations
+
+<Tabs>
+  <Tab title="Event Processing Overhead">
+    More assets = more event streams to coordinate:
+    
+    - **2 assets**: ~1.5x slower than single asset
+    - **5 assets**: ~3x slower
+    - **10 assets**: ~5x slower
+    
+    The `EventSet.next()` scans all asset timestamps linearly.
+  </Tab>
+  
+  <Tab title="Memory Usage">
+    Each asset maintains:
+    - Order book (~1-10 KB for L2)
+    - Order states (~1 KB per 100 orders)
+    - Historical data buffers
+    
+    10 assets with L2 data: ~100 MB typical
+  </Tab>
+  
+  <Tab title="Data Loading">
+    Enable parallel loading for multiple assets:
+    
+    ```python
+    asset = BacktestAsset().parallel_load(True)  # Default
+    ```
+    
+    Loads next data file in background while processing current.
+  </Tab>
+</Tabs>
+
+## Validation
+
+### Cross-Asset Consistency Checks
+
+```python
+@njit
+def validate_multi_asset_state(hbt):
+    num_assets = hbt.num_assets()
+    
+    # Check timestamp consistency
+    current_ts = hbt.current_timestamp()
+    for asset_no in range(num_assets):
+        exch_ts, local_ts = hbt.feed_latency(asset_no)
+        assert local_ts <= current_ts, f"Asset {asset_no} future timestamp!"
+    
+    # Check position limits
+    for asset_no in range(num_assets):
+        position = hbt.position(asset_no)
+        depth = hbt.depth(asset_no)
+        mid = (depth.best_bid + depth.best_ask) / 2.0
+        notional = abs(position * mid)
+        
+        MAX_NOTIONAL = 100_000  # $100k per asset
+        assert notional < MAX_NOTIONAL, f"Asset {asset_no} over limit"
+```
+
+### Correlation Analysis
+
+Verify asset price relationships:
+
+```python
+import numpy as np
+import pandas as pd
+
+# Collect mid prices over time
+btc_mids = []
+eth_mids = []
+
+# ... during backtest, record mids
+
+# Calculate correlation
+corr = np.corrcoef(btc_mids, eth_mids)[0, 1]
+print(f"BTC-ETH correlation: {corr:.3f}")
+
+# Verify it matches historical correlation
+assert 0.7 < corr < 0.95, "Unexpected correlation"
+```
+
+## Examples
+
+Official examples:
+
+<CardGroup cols={2}>
+  <Card title="Making Multiple Markets" icon="chart-line" href="https://hftbacktest.readthedocs.io/en/latest/tutorials/Making%20Multiple%20Markets.html">
+    Market making across multiple instruments simultaneously
+  </Card>
+  
+  <Card title="High-Frequency Grid Trading Comparison" icon="table-cells" href="https://hftbacktest.readthedocs.io/en/latest/tutorials/High-Frequency%20Grid%20Trading%20-%20Comparison%20Across%20Other%20Exchanges.html">
+    Comparing the same strategy across different exchanges
+  </Card>
+  
+  <Card title="Market Making with Alpha - Basis" icon="wave-square" href="https://hftbacktest.readthedocs.io/en/latest/tutorials/Market%20Making%20with%20Alpha%20-%20Basis.html">
+    Using basis between spot and futures as alpha signal
+  </Card>
+  
+  <Card title="Fusing Depth Data" icon="layer-group" href="https://hftbacktest.readthedocs.io/en/latest/tutorials/Fusing%20Depth%20Data.html">
+    Combining order books from multiple sources
+  </Card>
+</CardGroup>
+
+## Common Patterns
+
+### Iterate Over All Assets
+
+```python
+@njit
+def process_all_assets(hbt):
+    num_assets = hbt.num_assets()
+    for asset_no in range(num_assets):
+        depth = hbt.depth(asset_no)
+        # ... process each asset
+```
+
+### Asset-Specific Order IDs
+
+Avoid order ID collisions across assets:
+
+```python
+@njit
+def generate_order_id(asset_no, local_id):
+    # Encode asset number in upper bits
+    return (asset_no << 48) | local_id
+
+# Usage
+order_id = generate_order_id(0, 12345)  # Asset 0, local ID 12345
+hbt.submit_buy_order(0, order_id, price, qty, GTX, LIMIT, False)
+```
+
+### Clear All Inactive Orders
+
+```python
+# Clear inactive orders for all assets
+hbt.clear_inactive_orders(None)  # None = all assets
+
+# Or clear specific asset
+hbt.clear_inactive_orders(0)  # Only asset 0
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Backtesting" icon="clock" href="/concepts/backtesting">
+    Event-driven architecture supports multi-asset
+  </Card>
+  <Card title="Latency" icon="network-wired" href="/concepts/latency">
+    Different latencies per asset
+  </Card>
+  <Card title="Order Book" icon="book" href="/concepts/order-book">
+    Fused order books for cross-exchange strategies
+  </Card>
+</CardGroup>

@@ -1,0 +1,643 @@
+---
+title: HftBacktest Classes
+description: Core backtesting classes and market depth interfaces
+---
+
+## BacktestAsset
+
+Configures a single asset for backtesting.
+
+```python
+from hftbacktest import BacktestAsset
+
+asset = BacktestAsset()
+```
+
+### Methods
+
+<ParamField path="data" type="method">
+  Sets the feed data for the asset.
+  
+  **Parameters:**
+  - `data` (str | List[str] | NDArray | List[NDArray]): File paths to `.npz` files or NumPy arrays containing feed data
+  
+  **Returns:** `BacktestAsset` (for method chaining)
+  
+  ```python
+  asset.data('btcusdt_20240101.npz')
+  asset.data(['data1.npz', 'data2.npz'])
+  asset.data(numpy_array)
+  ```
+</ParamField>
+
+<ParamField path="linear_asset" type="method">
+  Configures the asset as a linear asset (standard futures/spot).
+  
+  **Parameters:**
+  - `contract_size` (float): The contract size or multiplier
+  
+  **Returns:** `BacktestAsset`
+  
+  ```python
+  asset.linear_asset(1.0)  # For spot markets
+  ```
+</ParamField>
+
+<ParamField path="inverse_asset" type="method">
+  Configures the asset as an inverse asset (inverse perpetuals).
+  
+  **Parameters:**
+  - `contract_size` (float): The contract size or multiplier
+  
+  **Returns:** `BacktestAsset`
+</ParamField>
+
+<ParamField path="intp_order_latency" type="method">
+  Uses interpolated order latency model based on historical latency data.
+  
+  **Parameters:**
+  - `data` (str | NDArray | List[str]): Historical order latency data in `.npz` format or NumPy array
+  - `latency_offset` (int, optional): Latency offset in nanoseconds. Default: 0
+  
+  **Returns:** `BacktestAsset`
+  
+  ```python
+  asset.intp_order_latency('order_latency.npz')
+  asset.intp_order_latency('latency.npz', latency_offset=100_000)
+  ```
+</ParamField>
+
+<ParamField path="initial_snapshot" type="method">
+  Sets the initial order book snapshot.
+  
+  **Parameters:**
+  - `data` (str | NDArray): File path or NumPy array of the initial snapshot
+  
+  **Returns:** `BacktestAsset`
+  
+  ```python
+  asset.initial_snapshot('snapshot.npz')
+  ```
+</ParamField>
+
+## HashMapMarketDepthBacktest
+
+Backtester using hashmap-based market depth. Suitable for most use cases.
+
+```python
+from hftbacktest import HashMapMarketDepthBacktest, BacktestAsset
+
+assets = [BacktestAsset().data('data.npz').linear_asset(1.0)]
+hbt = HashMapMarketDepthBacktest(assets)
+```
+
+**Parameters:**
+- `assets` (List[BacktestAsset]): List of configured backtest assets
+
+**Returns:** A JIT-compiled backtester instance for use in `@njit` functions
+
+### Properties
+
+<ResponseField name="current_timestamp" type="int64">
+  Current timestamp in the backtest (nanoseconds by default).
+  
+  ```python
+  ts = hbt.current_timestamp
+  ```
+</ResponseField>
+
+<ResponseField name="num_assets" type="uint64">
+  Total number of assets in the backtest.
+  
+  ```python
+  n = hbt.num_assets
+  ```
+</ResponseField>
+
+### Methods
+
+<ParamField path="depth" type="method">
+  Retrieves the market depth for a specific asset.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number (0-indexed)
+  
+  **Returns:** `HashMapMarketDepth` instance
+  
+  ```python
+  depth = hbt.depth(0)
+  best_bid = depth.best_bid
+  best_ask = depth.best_ask
+  ```
+</ParamField>
+
+<ParamField path="position" type="method">
+  Returns the current position for an asset.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  
+  **Returns:** `float64` - Position quantity (positive for long, negative for short)
+  
+  ```python
+  pos = hbt.position(0)
+  ```
+</ParamField>
+
+<ParamField path="state_values" type="method">
+  Retrieves state values including balance, fees, and trading statistics.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  
+  **Returns:** `StateValues` instance
+  
+  ```python
+  state = hbt.state_values(0)
+  balance = state.balance
+  fee = state.fee
+  ```
+</ParamField>
+
+<ParamField path="orders" type="method">
+  Returns the order dictionary for an asset.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  
+  **Returns:** `OrderDict` - Dictionary of active orders
+  
+  ```python
+  orders = hbt.orders(0)
+  if order_id in orders:
+      order = orders.get(order_id)
+  ```
+</ParamField>
+
+<ParamField path="submit_buy_order" type="method">
+  Submits a buy order.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  - `order_id` (uint64): Unique order ID
+  - `price` (float64): Order price
+  - `qty` (float64): Quantity to buy
+  - `time_in_force` (uint8): `GTC`, `GTX`, `FOK`, or `IOC`
+  - `order_type` (uint8): `LIMIT` or `MARKET`
+  - `wait` (bool): If True, wait for order response
+  
+  **Returns:** `int64` - 0 on success, 1 if end of data reached, negative on error
+  
+  ```python
+  from hftbacktest import GTX, LIMIT
+  
+  result = hbt.submit_buy_order(
+      asset_no=0,
+      order_id=1,
+      price=50000.0,
+      qty=0.01,
+      time_in_force=GTX,
+      order_type=LIMIT,
+      wait=False
+  )
+  ```
+</ParamField>
+
+<ParamField path="submit_sell_order" type="method">
+  Submits a sell order.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  - `order_id` (uint64): Unique order ID
+  - `price` (float64): Order price
+  - `qty` (float64): Quantity to sell
+  - `time_in_force` (uint8): `GTC`, `GTX`, `FOK`, or `IOC`
+  - `order_type` (uint8): `LIMIT` or `MARKET`
+  - `wait` (bool): If True, wait for order response
+  
+  **Returns:** `int64` - 0 on success, 1 if end of data reached, negative on error
+  
+  ```python
+  from hftbacktest import GTX, LIMIT
+  
+  result = hbt.submit_sell_order(
+      asset_no=0,
+      order_id=2,
+      price=50100.0,
+      qty=0.01,
+      time_in_force=GTX,
+      order_type=LIMIT,
+      wait=False
+  )
+  ```
+</ParamField>
+
+<ParamField path="cancel" type="method">
+  Cancels an order.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  - `order_id` (uint64): Order ID to cancel
+  - `wait` (bool): If True, wait for cancel response
+  
+  **Returns:** `int64` - 0 on success, 1 if end of data reached, negative on error
+  
+  ```python
+  hbt.cancel(asset_no=0, order_id=1, wait=True)
+  ```
+</ParamField>
+
+<ParamField path="modify" type="method">
+  Modifies an existing order.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  - `order_id` (uint64): Order ID to modify
+  - `price` (float64): New order price
+  - `qty` (float64): New order quantity
+  - `wait` (bool): If True, wait for modify response
+  
+  **Returns:** `int64` - 0 on success, 1 if end of data reached, negative on error
+  
+  ```python
+  hbt.modify(asset_no=0, order_id=1, price=50050.0, qty=0.02, wait=True)
+  ```
+</ParamField>
+
+<ParamField path="clear_inactive_orders" type="method">
+  Clears inactive orders from the order dictionary.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number, or `ALL_ASSETS` to clear all assets
+  
+  ```python
+  from hftbacktest import ALL_ASSETS
+  
+  hbt.clear_inactive_orders(0)  # Clear for asset 0
+  hbt.clear_inactive_orders(ALL_ASSETS)  # Clear all assets
+  ```
+</ParamField>
+
+<ParamField path="elapse" type="method">
+  Elapses time by the specified duration.
+  
+  **Parameters:**
+  - `duration` (uint64): Duration to elapse (nanoseconds by default)
+  
+  **Returns:** `int64` - 0 on success, 1 if end of data reached, negative on error
+  
+  ```python
+  # Elapse 10 milliseconds
+  if hbt.elapse(10_000_000) != 0:
+      # End of data reached
+      break
+  ```
+</ParamField>
+
+<ParamField path="wait_order_response" type="method">
+  Waits for an order response with timeout.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  - `order_id` (uint64): Order ID to wait for
+  - `timeout` (int64): Timeout in nanoseconds
+  
+  **Returns:** `int64` - 0 on response or timeout, 1 if end of data reached, negative on error
+  
+  ```python
+  # Wait up to 5 seconds for order response
+  timeout = 5_000_000_000
+  hbt.wait_order_response(asset_no=0, order_id=1, timeout=timeout)
+  ```
+</ParamField>
+
+<ParamField path="wait_next_feed" type="method">
+  Waits for the next market feed.
+  
+  **Parameters:**
+  - `include_order_resp` (bool): If True, also return on order responses
+  - `timeout` (int64): Timeout in nanoseconds
+  
+  **Returns:** `int64` - 0 on timeout, 1 on end of data, 2 on feed, 3 on order response
+  
+  ```python
+  result = hbt.wait_next_feed(include_order_resp=True, timeout=1_000_000_000)
+  ```
+</ParamField>
+
+<ParamField path="last_trades" type="method">
+  Retrieves recent market trades.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number
+  
+  **Returns:** NumPy array of trade events
+  
+  ```python
+  trades = hbt.last_trades(0)
+  for i in range(len(trades)):
+      price = trades[i].px
+      qty = trades[i].qty
+  ```
+</ParamField>
+
+<ParamField path="clear_last_trades" type="method">
+  Clears the last trades buffer.
+  
+  **Parameters:**
+  - `asset_no` (uint64): Asset number, or `ALL_ASSETS` to clear all
+  
+  ```python
+  hbt.clear_last_trades(0)
+  ```
+</ParamField>
+
+<ParamField path="close" type="method">
+  Closes the backtester.
+  
+  **Returns:** `int64` - 0 on success, negative on error
+  
+  ```python
+  hbt.close()
+  ```
+</ParamField>
+
+## ROIVectorMarketDepthBacktest
+
+Backtester using vector-based market depth with a defined range of interest (ROI). More efficient for strategies focusing on specific price ranges.
+
+```python
+from hftbacktest import ROIVectorMarketDepthBacktest, BacktestAsset
+
+assets = [BacktestAsset().data('data.npz').linear_asset(1.0)]
+hbt = ROIVectorMarketDepthBacktest(assets)
+```
+
+**Parameters:**
+- `assets` (List[BacktestAsset]): List of configured backtest assets
+
+**Returns:** A JIT-compiled backtester instance
+
+Provides the same interface as `HashMapMarketDepthBacktest`, but returns `ROIVectorMarketDepth` instead of `HashMapMarketDepth`.
+
+## HashMapMarketDepth
+
+Market depth interface using hashmap storage.
+
+### Properties
+
+<ResponseField name="best_bid" type="float64">
+  Best bid price.
+  
+  ```python
+  depth = hbt.depth(0)
+  bid = depth.best_bid
+  ```
+</ResponseField>
+
+<ResponseField name="best_ask" type="float64">
+  Best ask price.
+</ResponseField>
+
+<ResponseField name="best_bid_tick" type="int64">
+  Best bid price in ticks.
+</ResponseField>
+
+<ResponseField name="best_ask_tick" type="int64">
+  Best ask price in ticks.
+</ResponseField>
+
+<ResponseField name="best_bid_qty" type="float64">
+  Quantity at the best bid.
+</ResponseField>
+
+<ResponseField name="best_ask_qty" type="float64">
+  Quantity at the best ask.
+</ResponseField>
+
+<ResponseField name="tick_size" type="float64">
+  Minimum price increment.
+</ResponseField>
+
+<ResponseField name="lot_size" type="float64">
+  Minimum quantity increment.
+</ResponseField>
+
+### Methods
+
+<ParamField path="bid_qty_at_tick" type="method">
+  Returns the bid quantity at a specific price level.
+  
+  **Parameters:**
+  - `price_tick` (int64): Price in ticks
+  
+  **Returns:** `float64` - Quantity at the specified price
+  
+  ```python
+  price_tick = int(50000.0 / depth.tick_size)
+  qty = depth.bid_qty_at_tick(price_tick)
+  ```
+</ParamField>
+
+<ParamField path="ask_qty_at_tick" type="method">
+  Returns the ask quantity at a specific price level.
+  
+  **Parameters:**
+  - `price_tick` (int64): Price in ticks
+  
+  **Returns:** `float64` - Quantity at the specified price
+  
+  ```python
+  price_tick = int(50100.0 / depth.tick_size)
+  qty = depth.ask_qty_at_tick(price_tick)
+  ```
+</ParamField>
+
+## ROIVectorMarketDepth
+
+Market depth interface using vector storage within a range of interest.
+
+Provides the same properties and methods as `HashMapMarketDepth`, plus:
+
+### Additional Properties
+
+<ResponseField name="bid_depth" type="NDArray[float64]">
+  Array of bid quantities indexed by price tick within the ROI.
+  
+  ```python
+  depth = hbt.depth(0)
+  bid_array = depth.bid_depth
+  # Access quantity at price: (index + roi_lb_tick) * tick_size
+  ```
+</ResponseField>
+
+<ResponseField name="ask_depth" type="NDArray[float64]">
+  Array of ask quantities indexed by price tick within the ROI.
+</ResponseField>
+
+<ResponseField name="roi_lb_tick" type="int64">
+  Lower bound of the range of interest in ticks.
+</ResponseField>
+
+<ResponseField name="roi_ub_tick" type="int64">
+  Upper bound of the range of interest in ticks.
+</ResponseField>
+
+## Order
+
+Represents an order in the system.
+
+### Properties
+
+<ResponseField name="order_id" type="uint64">
+  Unique order identifier.
+</ResponseField>
+
+<ResponseField name="price" type="float64">
+  Order price.
+</ResponseField>
+
+<ResponseField name="price_tick" type="int64">
+  Order price in ticks.
+</ResponseField>
+
+<ResponseField name="qty" type="float64">
+  Order quantity.
+</ResponseField>
+
+<ResponseField name="leaves_qty" type="float64">
+  Remaining unfilled quantity.
+</ResponseField>
+
+<ResponseField name="side" type="int8">
+  Order side: `BUY` (1) or `SELL` (-1).
+</ResponseField>
+
+<ResponseField name="status" type="uint8">
+  Order status: `NONE`, `NEW`, `FILLED`, `CANCELED`, `EXPIRED`, `PARTIALLY_FILLED`.
+</ResponseField>
+
+<ResponseField name="order_type" type="uint8">
+  Order type: `LIMIT` or `MARKET`.
+</ResponseField>
+
+<ResponseField name="time_in_force" type="uint8">
+  Time-in-force: `GTC`, `GTX`, `FOK`, or `IOC`.
+</ResponseField>
+
+<ResponseField name="exec_price" type="float64">
+  Execution price (valid when status is `FILLED` or `PARTIALLY_FILLED`).
+</ResponseField>
+
+<ResponseField name="exec_qty" type="float64">
+  Executed quantity.
+</ResponseField>
+
+<ResponseField name="cancellable" type="bool">
+  Whether the order can be cancelled.
+</ResponseField>
+
+<ResponseField name="exch_timestamp" type="int64">
+  Exchange timestamp when order was processed.
+</ResponseField>
+
+<ResponseField name="local_timestamp" type="int64">
+  Local timestamp when order was submitted.
+</ResponseField>
+
+## StateValues
+
+Contains state information for an asset.
+
+### Properties
+
+<ResponseField name="position" type="float64">
+  Current open position.
+</ResponseField>
+
+<ResponseField name="balance" type="float64">
+  Cash balance.
+</ResponseField>
+
+<ResponseField name="fee" type="float64">
+  Accumulated trading fees.
+</ResponseField>
+
+<ResponseField name="num_trades" type="int64">
+  Total number of trades executed.
+</ResponseField>
+
+<ResponseField name="trading_volume" type="float64">
+  Total trading volume (quantity).
+</ResponseField>
+
+<ResponseField name="trading_value" type="float64">
+  Total trading value (notional).
+</ResponseField>
+
+## OrderDict
+
+Dictionary of active orders.
+
+### Methods
+
+<ParamField path="get" type="method">
+  Retrieves an order by ID.
+  
+  **Parameters:**
+  - `order_id` (uint64): Order ID
+  
+  **Returns:** `Order` instance or `None`
+  
+  ```python
+  order = orders.get(order_id)
+  if order is not None:
+      print(order.price)
+  ```
+</ParamField>
+
+<ParamField path="values" type="method">
+  Returns an iterator over order values.
+  
+  **Returns:** `Values` iterator
+  
+  ```python
+  # Method 1: Using has_next() and get()
+  values = orders.values()
+  while values.has_next():
+      order = values.get()
+      # Process order
+  
+  # Method 2: Using next()
+  values = orders.values()
+  while True:
+      order = values.next()
+      if order is None:
+          break
+      # Process order
+  ```
+</ParamField>
+
+<ParamField path="__contains__" type="method">
+  Checks if an order exists.
+  
+  **Parameters:**
+  - `order_id` (uint64): Order ID
+  
+  **Returns:** `bool`
+  
+  ```python
+  if order_id in orders:
+      order = orders.get(order_id)
+  ```
+</ParamField>
+
+<ParamField path="__len__" type="method">
+  Returns the number of active orders.
+  
+  **Returns:** `uint64`
+  
+  ```python
+  num_orders = len(orders)
+  ```
+</ParamField>

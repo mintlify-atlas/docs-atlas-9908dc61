@@ -1,0 +1,434 @@
+---
+title: Making Markets Across Multiple Assets
+description: Diversify risk and improve returns by trading multiple assets simultaneously
+---
+
+By diversifying across multiple assets and constructing a market-making portfolio, you can achieve improved risk-adjusted returns through the benefits of diversification. HftBacktest makes it easy to backtest and deploy multi-asset strategies.
+
+## Benefits of Multi-Asset Trading
+
+<Steps>
+
+### Portfolio Diversification
+
+Reduce overall risk by spreading capital across uncorrelated or weakly correlated assets.
+
+### Improved Risk-Adjusted Returns
+
+Diversification typically leads to higher Sharpe ratios and more stable returns.
+
+### Capital Efficiency
+
+Max drawdowns are often lower in multi-asset portfolios, allowing higher leverage.
+
+### Opportunity Maximization
+
+Capture more trading opportunities across different market conditions.
+
+</Steps>
+
+## Setting Up Multiple Assets
+
+Define and register multiple assets in your backtest:
+
+```python
+from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
+
+# Asset 1: BTCUSDT
+btc_asset = (
+    BacktestAsset()
+        .data(['data/btcusdt_20240809.npz'])
+        .initial_snapshot('data/btcusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .tick_size(0.1)
+        .lot_size(0.001)
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .roi_lb(60000.0)
+        .roi_ub(65000.0)
+)
+
+# Asset 2: ETHUSDT
+eth_asset = (
+    BacktestAsset()
+        .data(['data/ethusdt_20240809.npz'])
+        .initial_snapshot('data/ethusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .tick_size(0.01)
+        .lot_size(0.001)
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .roi_lb(3000.0)
+        .roi_ub(3500.0)
+)
+
+# Create backtest with multiple assets
+hbt = ROIVectorMarketDepthBacktest([btc_asset, eth_asset])
+```
+
+<Note>
+Assets are indexed starting from 0. Use the asset index to access each asset's data and methods.
+</Note>
+
+## Multi-Asset Strategy Example
+
+```python
+import numpy as np
+from numba import njit, uint64
+from numba.typed import Dict
+from hftbacktest import BUY, SELL, GTX, LIMIT
+
+@njit
+def multi_asset_grid_trading(hbt, recorder, order_quantities):
+    """
+    order_quantities: array of order quantities for each asset
+    """
+    num_assets = len(order_quantities)
+    
+    grid_num = 20
+    grid_interval_ticks = 10
+    half_spread_ticks = 20
+    
+    while hbt.elapse(100_000_000) == 0:
+        # Process each asset
+        for asset_no in range(num_assets):
+            hbt.clear_inactive_orders(asset_no)
+            
+            depth = hbt.depth(asset_no)
+            position = hbt.position(asset_no)
+            orders = hbt.orders(asset_no)
+            tick_size = depth.tick_size
+            
+            # Calculate max position based on order quantity
+            order_qty = order_quantities[asset_no]
+            max_position = grid_num * order_qty
+            
+            # Grid interval in price
+            grid_interval = grid_interval_ticks * tick_size
+            half_spread = half_spread_ticks * tick_size
+            
+            best_bid = depth.best_bid
+            best_ask = depth.best_ask
+            mid_price = (best_bid + best_ask) / 2.0
+            
+            # Align to grid
+            bid_price = np.floor((mid_price - half_spread) / grid_interval) * grid_interval
+            ask_price = np.ceil((mid_price + half_spread) / grid_interval) * grid_interval
+            
+            # Create buy grid
+            new_bid_orders = Dict.empty(np.uint64, np.float64)
+            if position < max_position and np.isfinite(bid_price):
+                for i in range(grid_num):
+                    bid_price_tick = round(bid_price / tick_size)
+                    new_bid_orders[uint64(bid_price_tick)] = bid_price
+                    bid_price -= grid_interval
+            
+            # Create sell grid
+            new_ask_orders = Dict.empty(np.uint64, np.float64)
+            if position > -max_position and np.isfinite(ask_price):
+                for i in range(grid_num):
+                    ask_price_tick = round(ask_price / tick_size)
+                    new_ask_orders[uint64(ask_price_tick)] = ask_price
+                    ask_price += grid_interval
+            
+            # Cancel old orders
+            order_values = orders.values()
+            while order_values.has_next():
+                order = order_values.get()
+                if order.cancellable:
+                    if (order.side == BUY and order.order_id not in new_bid_orders) or \
+                       (order.side == SELL and order.order_id not in new_ask_orders):
+                        hbt.cancel(asset_no, order.order_id, False)
+            
+            # Submit new orders
+            for order_id, order_price in new_bid_orders.items():
+                if order_id not in orders:
+                    hbt.submit_buy_order(asset_no, order_id, order_price, order_qty, GTX, LIMIT, False)
+            
+            for order_id, order_price in new_ask_orders.items():
+                if order_id not in orders:
+                    hbt.submit_sell_order(asset_no, order_id, order_price, order_qty, GTX, LIMIT, False)
+        
+        recorder.record(hbt)
+    
+    return True
+```
+
+## Normalizing Order Quantities
+
+Different assets have different price levels and liquidity. Normalize order quantities:
+
+```python
+@njit
+def calculate_normalized_quantities(hbt, target_notional):
+    """
+    Calculate order quantities to achieve similar notional value across assets
+    """
+    num_assets = hbt.num_assets
+    quantities = np.zeros(num_assets)
+    
+    for asset_no in range(num_assets):
+        depth = hbt.depth(asset_no)
+        lot_size = depth.lot_size
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Calculate quantity for target notional
+        raw_qty = target_notional / mid_price
+        
+        # Round to lot size
+        quantities[asset_no] = np.round(raw_qty / lot_size) * lot_size
+    
+    return quantities
+
+# Usage
+target_notional = 1000.0  # $1000 per order
+order_quantities = calculate_normalized_quantities(hbt, target_notional)
+```
+
+<Note>
+Normalizing by notional value ensures similar dollar risk across different assets.
+</Note>
+
+## Per-Asset Position Management
+
+Manage position limits for each asset independently:
+
+```python
+@njit
+def multi_asset_with_limits(hbt, max_positions):
+    """
+    max_positions: array of max position for each asset
+    """
+    num_assets = len(max_positions)
+    
+    while hbt.elapse(100_000_000) == 0:
+        for asset_no in range(num_assets):
+            position = hbt.position(asset_no)
+            max_pos = max_positions[asset_no]
+            
+            # Only trade if within position limits
+            if abs(position) < max_pos:
+                # ... execute strategy for this asset
+                pass
+```
+
+## Portfolio-Level Risk Management
+
+Monitor aggregate portfolio risk:
+
+```python
+@njit
+def portfolio_risk_check(hbt, max_total_notional):
+    num_assets = hbt.num_assets
+    total_notional = 0.0
+    
+    for asset_no in range(num_assets):
+        position = hbt.position(asset_no)
+        depth = hbt.depth(asset_no)
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        
+        total_notional += abs(position * mid_price)
+    
+    # Check if portfolio is within risk limits
+    if total_notional > max_total_notional:
+        # Risk limit exceeded - reduce positions
+        return False
+    
+    return True
+```
+
+## GLFT Multi-Asset Strategy
+
+Apply the GLFT model universally across assets with normalized parameters:
+
+```python
+import numpy as np
+from numba import njit
+
+@njit
+def compute_coeff(gamma, delta, A, k):
+    inv_k = 1.0 / k
+    c1 = (1.0 / (gamma * delta)) * np.log(1 + gamma * delta * inv_k)
+    c2 = np.sqrt(
+        (gamma / (2 * A * delta * k)) * 
+        ((1 + gamma * delta * inv_k) ** (k / (gamma * delta) + 1))
+    )
+    return c1, c2
+
+@njit
+def multi_asset_glft(hbt, recorder, order_quantities):
+    num_assets = len(order_quantities)
+    
+    # Model parameters (same for all assets)
+    gamma = 0.05
+    delta = 1.0
+    grid_num = 20
+    
+    # Per-asset tracking arrays
+    A_values = np.full(num_assets, np.nan)
+    k_values = np.full(num_assets, np.nan)
+    volatilities = np.full(num_assets, np.nan)
+    
+    # ... initialize tracking arrays for each asset
+    
+    while hbt.elapse(100_000_000) == 0:
+        for asset_no in range(num_assets):
+            # ... calibrate A, k, volatility for this asset
+            
+            A = A_values[asset_no]
+            k = k_values[asset_no]
+            vol = volatilities[asset_no]
+            
+            if np.isfinite(A) and np.isfinite(k) and np.isfinite(vol):
+                c1, c2 = compute_coeff(gamma, delta, A, k)
+                
+                # Calculate adaptive spread and skew
+                half_spread_tick = c1 + (delta / 2.0) * c2 * vol
+                skew = c2 * vol
+            else:
+                # Use defaults
+                half_spread_tick = 20.0
+                skew = 2.0
+            
+            # ... apply to grid trading logic for this asset
+        
+        recorder.record(hbt)
+    
+    return True
+```
+
+## Accessing Asset Data
+
+Key methods for multi-asset strategies:
+
+```python
+@njit
+def access_multi_asset_data(hbt):
+    num_assets = hbt.num_assets
+    
+    for asset_no in range(num_assets):
+        # Market depth
+        depth = hbt.depth(asset_no)
+        mid = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Position
+        position = hbt.position(asset_no)
+        
+        # Orders
+        orders = hbt.orders(asset_no)
+        
+        # State values (fee, balance, etc.)
+        fee = hbt.fee(asset_no)
+        balance = hbt.balance(asset_no)
+        
+        # Trade history
+        for trade in hbt.last_trades(asset_no):
+            # Process trade
+            pass
+        
+        hbt.clear_last_trades(asset_no)
+```
+
+## Complete Multi-Asset Example
+
+```python
+import numpy as np
+from numba import njit, uint64
+from numba.typed import Dict
+from hftbacktest import (
+    BacktestAsset,
+    ROIVectorMarketDepthBacktest,
+    Recorder,
+    BUY,
+    SELL,
+    GTX,
+    LIMIT
+)
+from hftbacktest.stats import LinearAssetRecord
+
+# Define assets
+assets = [
+    BacktestAsset()
+        .data(['data/btcusdt_20240809.npz'])
+        .initial_snapshot('data/btcusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .tick_size(0.1)
+        .lot_size(0.001)
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .roi_lb(60000.0)
+        .roi_ub(65000.0),
+    
+    BacktestAsset()
+        .data(['data/ethusdt_20240809.npz'])
+        .initial_snapshot('data/ethusdt_20240808_eod.npz')
+        .linear_asset(1.0)
+        .tick_size(0.01)
+        .lot_size(0.001)
+        .trading_value_fee_model(-0.00005, 0.0007)
+        .roi_lb(3000.0)
+        .roi_ub(3500.0),
+]
+
+hbt = ROIVectorMarketDepthBacktest(assets)
+recorder = Recorder(len(assets), 5_000_000)
+
+# Calculate normalized order quantities
+target_notional = 1000.0
+order_quantities = np.array([0.016, 0.32])  # Approximate for BTC and ETH
+
+# Run strategy
+multi_asset_grid_trading(hbt, recorder.recorder, order_quantities)
+_ = hbt.close()
+
+# Analyze each asset
+for asset_no in range(len(assets)):
+    print(f"\nAsset {asset_no} Statistics:")
+    stats = LinearAssetRecord(recorder.get(asset_no)).stats(book_size=10_000)
+    print(stats.summary())
+
+# Portfolio-level analysis
+print("\nPortfolio Statistics:")
+# Combine records for portfolio view
+# ... implement portfolio aggregation
+```
+
+## Best Practices
+
+<Steps>
+
+### Start with Correlated Assets
+
+Begin with 2-3 assets from the same market (e.g., crypto majors) before expanding.
+
+### Normalize Risk Across Assets
+
+Use notional value or volatility-adjusted position sizing.
+
+### Monitor Cross-Asset Correlation
+
+Adjust allocation if correlation increases (reduces diversification benefit).
+
+### Test Individual Assets First
+
+Ensure each asset performs well individually before combining.
+
+### Consider Execution Priority
+
+In live trading, prioritize assets by liquidity or opportunity.
+
+</Steps>
+
+## Performance Metrics
+
+Key metrics for multi-asset portfolios:
+
+- **Portfolio Sharpe Ratio**: Overall risk-adjusted return
+- **Max Portfolio Drawdown**: Worst peak-to-trough decline
+- **Asset Correlation**: Diversification effectiveness
+- **Per-Asset Contribution**: Each asset's impact on returns
+- **Capital Utilization**: How efficiently capital is deployed
+
+## Next Steps
+
+- Learn about [Live Trading Deployment](/guides/live-trading)
+- Review [Market Making Strategies](/guides/market-making)
+- See [Grid Trading Implementation](/guides/grid-trading)
+- Read the [Making Multiple Markets Tutorial](https://hftbacktest.readthedocs.io/en/latest/tutorials/Making%20Multiple%20Markets.html)

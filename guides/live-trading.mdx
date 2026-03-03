@@ -1,0 +1,452 @@
+---
+title: Deploying Live Trading Bots
+description: Deploy your backtested strategies to live trading with HftBacktest's live bot framework
+---
+
+HftBacktest provides a live trading framework that allows you to deploy the same algorithm code used in backtesting to live trading. This ensures consistency between backtested and live results.
+
+<Warning>
+**Use at your own risk.** Live trading features may not function correctly in all cases. Always test thoroughly on testnet before deploying to production.
+</Warning>
+
+## Supported Exchanges
+
+Currently supported exchanges:
+
+- **Binance Futures** (Tested on Testnet)
+  - Symbol format: lowercase (e.g., `btcusdt`)
+- **Bybit Futures** (Under development)
+  - Symbol format: uppercase (e.g., `BTCUSDT`)
+
+<Note>
+Connector and bots communicate via shared memory and must run on the same machine.
+</Note>
+
+## Architecture Overview
+
+The live trading system consists of two components:
+
+1. **Connector**: Manages exchange connections, market data feeds, and order routing
+2. **LiveBot**: Runs your trading strategy using the same interface as backtesting
+
+```
+┌─────────────┐
+│   Exchange  │
+└──────┬──────┘
+       │ WebSocket + REST API
+       ▼
+┌─────────────────┐
+│   Connector     │  (One per exchange)
+└────────┬────────┘
+         │ Shared Memory (IPC)
+         ▼
+┌─────────────────┐
+│    LiveBot 1    │  (Your strategy)
+└─────────────────┘
+┌─────────────────┐
+│    LiveBot 2    │  (Another strategy)
+└─────────────────┘
+```
+
+## Step 1: Build the Connector
+
+First, build the connector executable:
+
+```bash
+# Clone the repository
+git clone https://github.com/nkaz001/hftbacktest.git
+cd hftbacktest
+
+# Build connector
+cargo build --release --package connector
+
+# Connector binary will be at: target/release/connector
+```
+
+## Step 2: Configure the Connector
+
+Create a configuration file (e.g., `binancefutures.toml`):
+
+```toml
+# Binance Futures Testnet
+stream_url = "wss://fstream.binancefuture.com/ws"
+api_url = "https://testnet.binancefuture.com"
+
+# Binance Futures Mainnet
+# stream_url = "wss://fstream.binance.com/ws"
+# api_url = "https://fapi.binance.com"
+
+# Low-Latency Market Maker endpoints (if you have access)
+# stream_url = "wss://fstream-mm.binance.com/ws"
+# api_url = "https://fapi-mm.binance.com"
+
+order_prefix = "my_bot"
+api_key = "your_api_key_here"
+secret = "your_secret_here"
+```
+
+<Warning>
+Never commit API keys to version control. Use environment variables or secure key management.
+</Warning>
+
+## Step 3: Run the Connector
+
+Start the connector:
+
+```bash
+./target/release/connector \
+  --name bf \
+  --connector binancefutures \
+  --config binancefutures.toml
+```
+
+Parameters:
+- `--name`: Unique name for this connector instance
+- `--connector`: Exchange type (`binancefutures` or `bybit`)
+- `--config`: Path to configuration file
+
+## Step 4: Create a Live Bot
+
+### Rust Implementation
+
+Use the same algorithm code from backtesting:
+
+```rust
+use hftbacktest::{
+    live::{LiveBot, Instrument},
+    prelude::*,
+};
+
+fn main() {
+    let tick_size = 0.1;
+    let lot_size = 0.001;
+
+    let mut hbt = LiveBot::builder()
+        .register(Instrument::new(
+            "bf",              // Connector name
+            "btcusdt",         // Symbol (lowercase for Binance)
+            tick_size,
+            lot_size,
+            HashMapMarketDepth::new(tick_size, lot_size),
+            0                  // Initial position
+        ))
+        .error_handler(|error| {
+            eprintln!("Error: {:?}", error);
+            Ok(())
+        })
+        .build()
+        .unwrap();
+
+    // Run your strategy (same code as backtest)
+    my_strategy(&mut hbt);
+}
+
+fn my_strategy(hbt: &mut LiveBot<_, _>) {
+    let asset_no = 0;
+    
+    // Same interface as backtesting
+    loop {
+        if hbt.elapse(10_000_000_000).unwrap() != 0 {  // 10 seconds
+            break;
+        }
+        
+        let depth = hbt.depth(asset_no);
+        let position = hbt.position(asset_no);
+        
+        // Your trading logic here
+        // ...
+    }
+}
+```
+
+### Python Implementation (Coming Soon)
+
+Python bindings for live trading are planned. Currently, use Rust for live deployment.
+
+## LiveBot Interface
+
+The `LiveBot` provides the same interface as backtesting:
+
+### Elapse Time
+
+```rust
+// Wait for specified duration or next event
+let result = hbt.elapse(100_000_000)?;  // 100ms in nanoseconds
+
+match result {
+    ElapseResult::Ok => { /* Timeout */ },
+    ElapseResult::MarketFeed => { /* New market data */ },
+    ElapseResult::OrderResponse => { /* Order update */ },
+}
+```
+
+### Access Market Data
+
+```rust
+let depth = hbt.depth(asset_no);
+let best_bid = depth.best_bid;
+let best_ask = depth.best_ask;
+```
+
+### Submit Orders
+
+```rust
+use hftbacktest::prelude::*;
+
+// Buy order
+hbt.submit_buy_order(
+    asset_no,
+    order_id,
+    price,
+    qty,
+    TimeInForce::GTX,
+    OrdType::Limit,
+    false  // wait
+)?;
+
+// Sell order
+hbt.submit_sell_order(
+    asset_no,
+    order_id,
+    price,
+    qty,
+    TimeInForce::GTX,
+    OrdType::Limit,
+    false
+)?;
+```
+
+### Cancel Orders
+
+```rust
+hbt.cancel(asset_no, order_id, false)?;
+```
+
+### Clear Inactive Orders
+
+```rust
+hbt.clear_inactive_orders(asset_no);
+```
+
+## Error Handling
+
+Register an error handler to deal with connector errors:
+
+```rust
+let mut hbt = LiveBot::builder()
+    .register(instrument)
+    .error_handler(|error| {
+        match error {
+            LiveError::OrderError { symbol, order_id, error } => {
+                eprintln!("Order error on {}: {:?}", symbol, error);
+            },
+            LiveError::ConnectionError(e) => {
+                eprintln!("Connection error: {:?}", e);
+                // Potentially reconnect or exit
+            },
+            _ => {
+                eprintln!("Error: {:?}", error);
+            }
+        }
+        Ok(())
+    })
+    .build()?;
+```
+
+## Order Response Hook
+
+Monitor order status changes:
+
+```rust
+let mut hbt = LiveBot::builder()
+    .register(instrument)
+    .order_recv_hook(|old_order, new_order| {
+        println!("Order {} status: {:?} -> {:?}",
+            new_order.order_id,
+            old_order.status,
+            new_order.status
+        );
+        Ok(())
+    })
+    .build()?;
+```
+
+## Waiting for Order Responses
+
+Wait for specific order responses:
+
+```rust
+let order_id = 12345;
+
+// Submit order
+hbt.submit_buy_order(asset_no, order_id, price, qty, GTX, LIMIT, false)?;
+
+// Wait for response (max 5 seconds)
+let timeout = 5_000_000_000;  // 5 seconds in nanoseconds
+let received = hbt.wait_order_response(asset_no, order_id, timeout)?;
+
+if received {
+    println!("Order confirmed");
+} else {
+    println!("Timeout waiting for order response");
+}
+```
+
+## Multiple Instruments
+
+Register and trade multiple instruments:
+
+```rust
+let mut hbt = LiveBot::builder()
+    .register(Instrument::new(
+        "bf",
+        "btcusdt",
+        0.1,
+        0.001,
+        HashMapMarketDepth::new(0.1, 0.001),
+        0
+    ))
+    .register(Instrument::new(
+        "bf",
+        "ethusdt",
+        0.01,
+        0.001,
+        HashMapMarketDepth::new(0.01, 0.001),
+        0
+    ))
+    .build()?;
+
+// Access different instruments
+let btc_depth = hbt.depth(0);
+let eth_depth = hbt.depth(1);
+```
+
+## Best Practices
+
+<Steps>
+
+### Test on Testnet First
+
+Always test your bot on exchange testnets before deploying to production.
+
+### Use Unique Bot IDs
+
+Set unique IDs for each bot instance:
+
+```rust
+let mut hbt = LiveBot::builder()
+    .id(12345)  // Unique bot ID
+    .register(instrument)
+    .build()?;
+```
+
+### Implement Proper Error Handling
+
+Handle all error cases gracefully. Don't let the bot crash silently.
+
+### Monitor Position and Risk
+
+Continuously check:
+- Current position
+- Open orders
+- Account balance
+- Risk limits
+
+### Log Everything
+
+Use proper logging for debugging and monitoring:
+
+```rust
+use tracing::{info, warn, error};
+
+info!("Starting bot for {}", symbol);
+warn!("Position approaching limit: {}", position);
+error!("Failed to submit order: {:?}", err);
+```
+
+### Implement Graceful Shutdown
+
+Handle SIGTERM/SIGINT to close positions before exit:
+
+```rust
+use tokio::signal;
+
+#[tokio::main]
+async fn main() {
+    let mut hbt = LiveBot::builder().register(instrument).build().unwrap();
+    
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            println!("Shutdown signal received");
+            // Close all positions
+            // Cancel all orders
+            // ...
+        }
+        _ = run_strategy(&mut hbt) => {}
+    }
+}
+```
+
+</Steps>
+
+## Monitoring and Maintenance
+
+### Health Checks
+
+Implement periodic health checks:
+
+```rust
+fn health_check(hbt: &LiveBot<_, _>) -> bool {
+    // Check connection status
+    // Check last market data timestamp
+    // Check order response latency
+    // etc.
+    true
+}
+```
+
+### Performance Monitoring
+
+Track key metrics:
+- Order latency (submission to acknowledgment)
+- Market data latency (exchange timestamp to local receipt)
+- Fill rate
+- P&L
+- Position
+
+### Alerting
+
+Set up alerts for:
+- Connection losses
+- Position limit breaches
+- Unusual P&L changes
+- Order rejections
+
+## Troubleshooting
+
+### Bot Can't Connect to Connector
+
+- Ensure connector is running
+- Check connector name matches
+- Verify shared memory permissions
+
+### Orders Not Filling
+
+- Check if orders are actually submitted (order response received)
+- Verify prices are competitive
+- Check if using GTX when you should use GTC
+
+### High Latency
+
+- Use low-latency endpoints if available
+- Colocate bot near exchange
+- Reduce elapse interval if too high
+- Use ROIVectorMarketDepth instead of HashMap for better performance
+
+## Next Steps
+
+- Review [Market Making Strategies](/guides/market-making)
+- Study [Grid Trading Implementation](/guides/grid-trading)
+- Learn about [Multi-Market Trading](/guides/multi-market)
+- Read the [Connector README](https://github.com/nkaz001/hftbacktest/blob/master/connector/README.md)
+- Join the community for support and discussions

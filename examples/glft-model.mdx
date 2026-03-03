@@ -1,0 +1,245 @@
+---
+title: Guéant-Lehalle-Fernandez-Tapia Market Making Model and Grid Trading
+description: Using the GLFT model to dynamically adjust spread and skew for grid trading
+---
+
+## Overview
+
+Grid trading is straightforward and easy to comprehend, and it excels in high-frequency environments. However, optimizing the ideal spread, order interval, and skew can be challenging, especially as these values fluctuate over time with market conditions.
+
+To improve grid trading's adaptability, we can combine it with the Guéant-Lehalle-Fernandez-Tapia (GLFT) market making model.
+
+## Guéant-Lehalle-Fernandez-Tapia Market Making Model
+
+This model represents an advanced evolution of the well-known Avellaneda-Stoikov model and provides a closed-form approximation of asymptotic behavior for terminal time T. This model does not specify a terminal time, making it suitable for typical stocks, spot assets, or crypto perpetual contracts.
+
+We focus on equations (4.6) and (4.7) from [Optimal market making](https://arxiv.org/abs/1605.01862):
+
+The optimal bid quote depth, $\delta^{b*}_{approx}$, and ask quote depth, $\delta^{a*}_{approx}$, are derived from the fair price as follows:
+
+$$
+\delta^{b*}_{approx}(q) = \frac{1}{\xi \Delta}\log\left(1 + \frac{\xi \Delta}{k}\right) + \frac{2q + \Delta}{2}\sqrt{\frac{\gamma \sigma^2}{2A\Delta k}\left(1 + \frac{\xi \Delta}{k}\right)^{\frac{k}{\xi \Delta} + 1}}
+$$
+
+$$
+\delta^{a*}_{approx}(q) = \frac{1}{\xi \Delta}\log\left(1 + \frac{\xi \Delta}{k}\right) - \frac{2q - \Delta}{2}\sqrt{\frac{\gamma \sigma^2}{2A\Delta k}\left(1 + \frac{\xi \Delta}{k}\right)^{\frac{k}{\xi \Delta} + 1}}
+$$
+
+We can introduce $c_1$ and $c_2$ and define them by extracting the volatility σ from the square root:
+
+$$
+c_1 = \frac{1}{\xi \Delta}\log\left(1 + \frac{\xi \Delta}{k}\right)
+$$
+
+$$
+c_2 = \sqrt{\frac{\gamma}{2A\Delta k}\left(1 + \frac{\xi \Delta}{k}\right)^{\frac{k}{\xi \Delta} + 1}}
+$$
+
+These equations consist of the half spread and skew:
+
+$$
+\text{half spread} = c_1 + \frac{\Delta}{2} \sigma c_2
+$$
+
+$$
+\text{skew} = \sigma c_2
+$$
+
+$$
+\text{bid price} = \text{fair price} - (\text{half spread} + \text{skew} \times q)
+$$
+
+$$
+\text{ask price} = \text{fair price} + (\text{half spread} - \text{skew} \times q)
+$$
+
+where $q$ represents a market maker's inventory (position).
+
+## Calculating Trading Intensity
+
+To determine the optimal quotes, we need to compute $c_1$ and $c_2$. This requires calibrating $A$ and $k$ of trading intensity and calculating the market volatility $\sigma$.
+
+Trading intensity is defined as:
+
+$$
+\lambda = A \exp(-k \delta)
+$$
+
+### Measuring Trading Intensity
+
+```python
+@njit
+def measure_trading_intensity_and_volatility(hbt):
+    tick_size = hbt.depth(0).tick_size
+    arrival_depth = np.full(10_000_000, np.nan, np.float64)
+    mid_price_chg = np.full(10_000_000, np.nan, np.float64)
+
+    t = 0
+    prev_mid_price_tick = np.nan
+    mid_price_tick = np.nan
+    
+    # Check every 100 milliseconds
+    while hbt.elapse(100_000_000) == 0:
+        # Record market order's arrival depth from the mid-price
+        if not np.isnan(mid_price_tick):
+            depth = -np.inf
+            for last_trade in hbt.last_trades(0):
+                trade_price_tick = last_trade.px / tick_size
+                
+                if last_trade.ev & BUY_EVENT == BUY_EVENT:
+                    depth = np.nanmax([trade_price_tick - mid_price_tick, depth])
+                else:
+                    depth = np.nanmax([mid_price_tick - trade_price_tick, depth])
+            arrival_depth[t] = depth
+        
+        hbt.clear_last_trades(0)
+        depth = hbt.depth(0)
+
+        best_bid_tick = depth.best_bid_tick
+        best_ask_tick = depth.best_ask_tick
+        
+        prev_mid_price_tick = mid_price_tick
+        mid_price_tick = (best_bid_tick + best_ask_tick) / 2.0
+        
+        # Record the mid-price change for volatility calculation
+        mid_price_chg[t] = mid_price_tick - prev_mid_price_tick
+        
+        t += 1
+        if t >= len(arrival_depth) or t >= len(mid_price_chg):
+            raise Exception
+    return arrival_depth[:t], mid_price_chg[:t]
+```
+
+### Calibrating A and k
+
+Using linear regression on the logarithm of lambda:
+
+```python
+@njit
+def linear_regression(x, y):
+    sx = np.sum(x)
+    sy = np.sum(y)
+    sx2 = np.sum(x ** 2)
+    sxy = np.sum(x * y)
+    w = len(x)
+    slope = (w * sxy - sx * sy) / (w * sx2 - sx**2)
+    intercept = (sy - slope * sx) / w
+    return slope, intercept
+
+# Calibrate A and k
+y = np.log(lambda_)
+k_, logA = linear_regression(ticks, y)
+A = np.exp(logA)
+k = -k_
+```
+
+## Implementation
+
+```python
+@njit
+def compute_coeff(xi, gamma, delta, A, k):
+    inv_k = np.divide(1, k)
+    c1 = 1 / (xi * delta) * np.log(1 + xi * delta * inv_k)
+    c2 = np.sqrt(np.divide(gamma, 2 * A * delta * k) * ((1 + xi * delta * inv_k) ** (k / (xi * delta) + 1)))
+    return c1, c2
+
+@njit
+def glft_market_maker(hbt, recorder):
+    tick_size = hbt.depth(0).tick_size
+    arrival_depth = np.full(10_000_000, np.nan, np.float64)
+    mid_price_chg = np.full(10_000_000, np.nan, np.float64)
+
+    t = 0
+    A = np.nan
+    k = np.nan
+    volatility = np.nan
+    gamma = 0.05
+    delta = 1
+
+    order_qty = 1
+    max_position = 20
+    
+    while hbt.elapse(100_000_000) == 0:
+        # Record market data
+        # ...
+        
+        # Update A, k, and volatility every 5 seconds
+        if t % 50 == 0:
+            if t >= 6_000 - 1:
+                # Calibrate A, k using 10-minute window
+                tmp = np.zeros(500, np.float64)
+                lambda_ = measure_trading_intensity(arrival_depth[t + 1 - 6_000:t + 1], tmp)
+                if len(lambda_) > 2:
+                    lambda_ = lambda_[:70] / 600
+                    x = ticks[:len(lambda_)]
+                    y = np.log(lambda_)
+                    k_, logA = linear_regression(x, y)
+                    A = np.exp(logA)
+                    k = -k_
+           
+                # Update volatility
+                volatility = np.nanstd(mid_price_chg[t + 1 - 6_000:t + 1]) * np.sqrt(10)
+    
+        # Compute bid and ask prices
+        c1, c2 = compute_coeff(gamma, gamma, delta, A, k)
+        
+        half_spread_tick = c1 + delta / 2 * c2 * volatility
+        skew = c2 * volatility
+
+        reservation_price_tick = mid_price_tick - skew * position
+
+        bid_price_tick = np.minimum(np.round(reservation_price_tick - half_spread_tick), best_bid_tick)
+        ask_price_tick = np.maximum(np.round(reservation_price_tick + half_spread_tick), best_ask_tick)
+        
+        # Update quotes
+        # ...
+        
+        t += 1
+        recorder.record(hbt)
+    return True
+```
+
+## Adjustment Factors
+
+You can introduce adjustment factors to fine-tune the calculated half spread and skew:
+
+$$
+\text{half spread}_{adj} = \text{half spread} \times adj_1
+$$
+
+$$
+\text{skew}_{adj} = \text{skew} \times adj_2
+$$
+
+Example:
+```python
+adj1 = 1.0  # Keep half spread as calculated
+adj2 = 0.05  # Reduce skew to 5% of calculated value
+
+half_spread_tick = (c1 + delta / 2 * c2 * volatility) * adj1
+skew = c2 * volatility * adj2
+```
+
+## Key Parameters
+
+- **gamma**: Risk aversion parameter (typically 0.05)
+- **delta**: Order size increment (typically 1)
+- **A, k**: Trading intensity parameters (calibrated from market data)
+- **volatility**: Market volatility (calculated from mid-price changes)
+- **window**: Calibration window size (e.g., 10 minutes = 6,000 ticks at 100ms)
+
+## Performance Considerations
+
+The GLFT model automatically adjusts:
+- Spread based on market volatility
+- Skew based on inventory risk
+- Response to changing market conditions
+
+This makes it more adaptive than fixed-parameter grid trading, especially in:
+- Volatile markets
+- Assets with changing liquidity
+- Environments where rebates are available
+
+<Note>
+The model works best when trading intensity is accurately calibrated and when the market exhibits consistent microstructure patterns.
+</Note>

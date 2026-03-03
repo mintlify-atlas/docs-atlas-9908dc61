@@ -1,0 +1,249 @@
+---
+title: Tick-by-Tick Backtesting
+description: How HftBacktest simulates high-frequency trading with complete tick-level accuracy
+---
+
+## Overview
+
+HftBacktest implements a complete tick-by-tick backtesting approach that processes every market event in chronological order. Unlike traditional backtesting frameworks that operate on OHLCV bars, HftBacktest replays the market exactly as it occurred, event by event.
+
+## Event-Driven Architecture
+
+The backtesting engine operates on an event-driven model where all market activity is represented as discrete events:
+
+<CodeGroup>
+```rust Event Processing
+// From hftbacktest/src/backtest/evs.rs
+pub enum EventIntentKind {
+    LocalData = 0,    // Feed data received locally
+    LocalOrder = 1,   // Order response received locally
+    ExchData = 2,     // Event occurred on exchange
+    ExchOrder = 3,    // Order processed on exchange
+}
+```
+
+```python Using the Backtester
+@njit
+def market_making_algo(hbt):
+    asset_no = 0
+    # Elapse time in nanoseconds (10ms)
+    while hbt.elapse(10_000_000) == 0:
+        # Process market depth
+        depth = hbt.depth(asset_no)
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # Submit orders
+        hbt.submit_buy_order(asset_no, order_id, price, qty, GTX, LIMIT, False)
+```
+</CodeGroup>
+
+## Event Timeline
+
+The backtester maintains separate event streams for each asset and coordinates them using an `EventSet` that tracks timestamps:
+
+<Steps>
+  <Step title="Event Collection">
+    All events (feed data, order responses, executions) are collected with their timestamps
+  </Step>
+  
+  <Step title="Timestamp Ordering">
+    The `EventSet` identifies the next event with the earliest timestamp across all assets and processors
+  </Step>
+  
+  <Step title="Event Processing">
+    The event is processed by the appropriate processor (local or exchange)
+  </Step>
+  
+  <Step title="State Update">
+    Market depth, orders, positions, and balances are updated atomically
+  </Step>
+</Steps>
+
+## Local vs Exchange Processors
+
+HftBacktest separates the simulation into two processors to accurately model the distributed nature of trading:
+
+### Local Processor
+
+Represents your trading system:
+- Sees market feed data at `local_ts` (after feed latency)
+- Submits orders at the current simulation time
+- Receives order responses at `local_ts` (after round-trip latency)
+- Maintains your view of the order book
+
+### Exchange Processor
+
+Represents the exchange:
+- Processes events at `exch_ts` (exchange timestamp)
+- Receives orders at `exch_ts + entry_latency`
+- Simulates order fills based on queue position
+- Sends responses back at `exch_ts + entry_latency + response_latency`
+
+This dual-processor architecture from `hftbacktest/src/backtest/mod.rs:673-863` ensures accurate latency modeling.
+
+## Time Control
+
+You control simulation time through several methods:
+
+<CardGroup cols={2}>
+  <Card title="elapse()" icon="clock">
+    Advance time by a fixed duration
+    ```python
+    hbt.elapse(1_000_000)  # 1ms in nanoseconds
+    ```
+  </Card>
+  
+  <Card title="wait_next_feed()" icon="signal">
+    Wait for the next market feed event
+    ```python
+    hbt.wait_next_feed(True, timeout)
+    ```
+  </Card>
+  
+  <Card title="wait_order_response()" icon="reply">
+    Wait for a specific order response
+    ```python
+    hbt.wait_order_response(asset_no, order_id, timeout)
+    ```
+  </Card>
+  
+  <Card title="goto_end()" icon="forward">
+    Process all remaining events
+    ```python
+    hbt.goto_end()
+    ```
+  </Card>
+</CardGroup>
+
+## Tick-by-Tick Accuracy
+
+The simulation processes every event in the feed data:
+
+<Tabs>
+  <Tab title="Depth Updates">
+    Every Level-2 order book update is applied:
+    ```python
+    # Each bid/ask update changes the order book
+    depth.update_bid_depth(price, qty, timestamp)
+    depth.update_ask_depth(price, qty, timestamp)
+    ```
+  </Tab>
+  
+  <Tab title="Trade Events">
+    Every market trade is processed:
+    ```python
+    # Trades affect queue position
+    queue_model.trade(order, trade_qty, depth)
+    ```
+  </Tab>
+  
+  <Tab title="Order Events">
+    Every order lifecycle event is captured:
+    - Order submission
+    - Order acceptance
+    - Partial fills
+    - Complete fills
+    - Cancellations
+    - Rejections
+  </Tab>
+</Tabs>
+
+## Performance Optimization
+
+Despite processing every tick, HftBacktest maintains high performance:
+
+<AccordionGroup>
+  <Accordion title="Numba JIT Compilation">
+    Python strategies are compiled to machine code via Numba, achieving near-native performance:
+    ```python
+    @njit  # Just-in-time compilation
+    def strategy(hbt):
+        # Runs at compiled speed
+    ```
+  </Accordion>
+  
+  <Accordion title="Rust Implementation">
+    The core backtesting engine is written in Rust for maximum performance. Event processing in `mod.rs:755-863` uses unsafe optimizations for zero-cost abstractions.
+  </Accordion>
+  
+  <Accordion title="Parallel Data Loading">
+    Data files are loaded in parallel while backtesting runs:
+    ```rust
+    .parallel_load(true)  // Default enabled
+    ```
+  </Accordion>
+  
+  <Accordion title="Efficient Data Structures">
+    - `HashMap` for fast order lookup
+    - `VecDeque` for FIFO queue management
+    - Cache-aligned arrays for event processing
+  </Accordion>
+</AccordionGroup>
+
+## Why Tick-by-Tick Matters
+
+For high-frequency strategies, bar-based backtesting is insufficient:
+
+<Warning>
+  **Bar-based backtesting problems:**
+  - Cannot simulate queue position (critical for maker strategies)
+  - Missing intrabar price action and order book dynamics
+  - Unrealistic fill assumptions
+  - No latency modeling
+  - Overstates profitability of HFT strategies
+</Warning>
+
+<Check>
+  **Tick-by-tick advantages:**
+  - Accurate queue position simulation
+  - Real order book reconstruction
+  - Proper latency accounting
+  - Realistic fill simulation
+  - Validates actual live trading results
+</Check>
+
+## Example: Event Processing Flow
+
+Here's how a typical market making strategy processes events:
+
+```python
+@njit
+def market_making_algo(hbt):
+    while hbt.elapse(10_000_000) == 0:  # Every 10ms
+        # 1. Clear filled/canceled orders
+        hbt.clear_inactive_orders(asset_no)
+        
+        # 2. Calculate new quotes based on current market
+        depth = hbt.depth(asset_no)
+        mid = (depth.best_bid + depth.best_ask) / 2.0
+        
+        # 3. Manage existing orders
+        orders = hbt.orders(asset_no)
+        # Cancel orders if price has moved
+        
+        # 4. Submit new orders
+        hbt.submit_buy_order(asset_no, bid_order_id, bid_price, qty, GTX, LIMIT, False)
+        hbt.submit_sell_order(asset_no, ask_order_id, ask_price, qty, GTX, LIMIT, False)
+        
+        # 5. Wait for responses
+        hbt.wait_order_response(asset_no, last_order_id, timeout)
+```
+
+Each iteration processes all market events that occurred in that 10ms window, maintaining complete accuracy.
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Latency Modeling" icon="network-wired" href="/concepts/latency">
+    How feed and order latencies are simulated
+  </Card>
+  <Card title="Order Book" icon="book" href="/concepts/order-book">
+    Level-2 and Level-3 order book reconstruction
+  </Card>
+  <Card title="Queue Position" icon="list-ol" href="/concepts/queue-position">
+    Order fill simulation using queue models
+  </Card>
+  <Card title="Multi-Asset" icon="layer-group" href="/concepts/multi-asset">
+    Backtesting across multiple assets and exchanges
+  </Card>
+</CardGroup>

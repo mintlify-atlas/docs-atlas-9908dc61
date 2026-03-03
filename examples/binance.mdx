@@ -1,0 +1,313 @@
+---
+title: "Binance Futures Integration"
+description: "Connect and trade on Binance Futures with HftBacktest"
+---
+
+## Overview
+
+HftBacktest provides full support for Binance Futures (USDⓈ-M) integration, allowing you to run the same algorithm code for both backtesting and live trading. The connector manages market data streaming and order execution through shared memory IPC.
+
+## Setup
+
+### 1. Build the Connector
+
+First, build the connector from source:
+
+```bash
+cd hftbacktest
+cargo build --release --package connector
+```
+
+The executable will be located at `target/release/connector`.
+
+### 2. Configure Connection
+
+Create a configuration file for Binance Futures:
+
+```toml binancefutures.toml
+# Testnet: wss://fstream.binancefuture.com/ws
+# Mainnet: wss://fstream.binance.com/ws
+# Private: wss://fstream-auth.binance.com/ws
+# Low-Latency Market Maker: wss://fstream-mm.binance.com/ws
+stream_url = "wss://fstream.binancefuture.com/ws"
+
+# Testnet: https://testnet.binancefuture.com
+# Mainnet: https://fapi.binance.com
+# Low-Latency Market Maker: https://fapi-mm.binance.com
+api_url = "https://testnet.binancefuture.com"
+
+order_prefix = "bot"
+api_key = "YOUR_API_KEY"
+secret = "YOUR_SECRET_KEY"
+```
+
+<Warning>
+  **Symbols must be lowercase** for Binance Futures (e.g., `btcusdt`, not `BTCUSDT`).
+</Warning>
+
+### 3. Run the Connector
+
+Start the connector with your configuration:
+
+```bash
+connector --name bf --connector binancefutures --config binancefutures.toml
+```
+
+The connector runs on the same machine as your bot and communicates via shared memory.
+
+## Data Conversion
+
+Convert raw Binance Futures feed data for backtesting:
+
+### Basic Conversion
+
+```python
+from hftbacktest.data.utils import binancefutures
+
+# Convert gzipped feed data
+data = binancefutures.convert(
+    input_filename="btcusdt_20220831.gz",
+    output_filename="btcusdt_20220831.npz"
+)
+```
+
+### Feed Data Format
+
+The raw feed file contains local timestamp followed by JSON stream data:
+
+```text
+1660228023037049 {"stream":"btcusdt@depth@0ms","data":{"e":"depthUpdate","E":1660228023941,"T":1660228023931,"s":"BTCUSDT","U":1801732831593,"u":1801732832589,"pu":1801732831561,"b":[["24644.00","44.832"],["24645.40","0.203"]],"a":[["24653.60","0.000"],["24670.20","0.000"]]}}
+1660228023043260 {"stream":"btcusdt@trade","data":{"e":"trade","E":1660228023980,"T":1660228023973,"s":"BTCUSDT","t":2691833663,"p":"24670.90","q":"0.022","X":"MARKET","m":true}}
+```
+
+### Advanced Options
+
+```python
+# Process additional streams
+data = binancefutures.convert(
+    input_filename="btcusdt_20220831.gz",
+    output_filename="btcusdt_20220831.npz",
+    opt="mt",  # Include markPriceUpdate and bookTicker
+    base_latency=0,
+    combined_stream=True,
+    buffer_size=100_000_000
+)
+```
+
+**Options:**
+- `opt="m"`: Process mark price updates with custom event IDs (100: index, 101: mark price, 102: funding rate)
+- `opt="t"`: Process book ticker with custom event IDs (103: best bid, 104: best ask)
+- `opt="mt"`: Combine both options
+- `base_latency`: Adjust feed latency by specified amount
+- `combined_stream`: Set to `False` for regular stream format
+
+## Live Trading (Rust)
+
+### Basic Live Bot
+
+```rust
+use hftbacktest::{
+    live::{
+        Instrument,
+        LiveBot,
+        LiveBotBuilder,
+        LoggingRecorder,
+        ipc::iceoryx::IceoryxUnifiedChannel,
+    },
+    prelude::{Bot, HashMapMarketDepth},
+};
+
+fn prepare_live() -> LiveBot<IceoryxUnifiedChannel, HashMapMarketDepth> {
+    LiveBotBuilder::new()
+        .register(Instrument::new(
+            "binancefutures",  // connector name
+            "1000shibusdt",    // symbol (lowercase!)
+            0.000001,          // tick_size
+            1.0,               // lot_size
+            HashMapMarketDepth::new(0.000001, 1.0),
+            0,
+        ))
+        .build()
+        .unwrap()
+}
+
+fn main() {
+    let mut hbt = prepare_live();
+    
+    // Run your algorithm
+    // The same algo code works for both backtest and live
+    gridtrading(
+        &mut hbt,
+        &mut recorder,
+        relative_half_spread,
+        relative_grid_interval,
+        grid_num,
+        min_grid_step,
+        skew,
+        order_qty,
+        max_position,
+    )
+    .unwrap();
+    
+    hbt.close().unwrap();
+}
+```
+
+### Error Handling
+
+```rust
+let mut hbt = LiveBotBuilder::new()
+    .register(Instrument::new(
+        "binancefutures",
+        "btcusdt",
+        0.1,
+        0.001,
+        HashMapMarketDepth::new(0.1, 0.001),
+        0,
+    ))
+    .error_handler(|error| {
+        match error.kind {
+            ErrorKind::ConnectionInterrupted => {
+                error!("Connection interrupted - will retry");
+            }
+            ErrorKind::CriticalConnectionError => {
+                error!("Critical connection error");
+            }
+            ErrorKind::OrderError => {
+                let error = error.value();
+                error!(?error, "Order error occurred");
+            }
+            ErrorKind::Custom(errno) => {
+                error!(%errno, "Custom error");
+            }
+        }
+        Ok(())
+    })
+    .build()
+    .unwrap();
+```
+
+## Complete Example
+
+Here's a complete market making example that works for both backtest and live:
+
+```python
+import numpy as np
+from numba import njit
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest, BUY, SELL, GTX, LIMIT
+
+@njit
+def market_making_algo(hbt):
+    asset_no = 0
+    tick_size = hbt.depth(asset_no).tick_size
+    lot_size = hbt.depth(asset_no).lot_size
+
+    # in nanoseconds
+    while hbt.elapse(10_000_000) == 0:
+        hbt.clear_inactive_orders(asset_no)
+
+        depth = hbt.depth(asset_no)
+        mid_price = (depth.best_bid + depth.best_ask) / 2.0
+        
+        position = hbt.position(asset_no)
+        half_spread = 0.0005 * mid_price
+        
+        # Calculate reservation price with inventory skew
+        skew = -0.001 * position
+        reservation_price = mid_price + skew
+        
+        new_bid = reservation_price - half_spread
+        new_ask = reservation_price + half_spread
+        
+        new_bid_tick = min(np.round(new_bid / tick_size), depth.best_bid_tick)
+        new_ask_tick = max(np.round(new_ask / tick_size), depth.best_ask_tick)
+        
+        order_qty = 100 / mid_price  # $100 per order
+        order_qty = np.round(order_qty / lot_size) * lot_size
+        
+        # Submit orders
+        hbt.submit_buy_order(
+            asset_no, 
+            new_bid_tick,  # order_id
+            new_bid_tick * tick_size, 
+            order_qty, 
+            GTX, 
+            LIMIT, 
+            False
+        )
+        hbt.submit_sell_order(
+            asset_no,
+            new_ask_tick,  # order_id
+            new_ask_tick * tick_size,
+            order_qty,
+            GTX,
+            LIMIT,
+            False
+        )
+    return True
+
+if __name__ == '__main__':
+    # Backtesting configuration
+    asset = (
+        BacktestAsset()
+            .data(['data/btcusdt_20220831.npz'])
+            .linear_asset(1.0)
+            .intp_order_latency(['latency/live_order_latency_20220831.npz'])
+            .power_prob_queue_model(2.0)
+            .no_partial_fill_exchange()
+            .trading_value_fee_model(-0.00005, 0.0007)  # maker rebate, taker fee
+            .tick_size(0.1)
+            .lot_size(0.001)
+    )
+    hbt = HashMapMarketDepthBacktest([asset])
+    market_making_algo(hbt)
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Use Market Maker Endpoints" icon="gauge-high">
+    Binance offers low-latency endpoints for market makers:
+    - WebSocket: `wss://fstream-mm.binance.com/ws`
+    - REST: `https://fapi-mm.binance.com`
+  </Card>
+  
+  <Card title="Test on Testnet First" icon="flask">
+    Always test your strategies on testnet before going live:
+    - No real funds at risk
+    - Same API structure
+    - Testnet URL: `https://testnet.binancefuture.com`
+  </Card>
+  
+  <Card title="Monitor Latency" icon="clock">
+    Use the latency logging feature to track order latencies:
+    ```rust
+    use hftbacktest::live::LoggingRecorder;
+    let mut recorder = LoggingRecorder::new();
+    ```
+  </Card>
+  
+  <Card title="Handle Reconnections" icon="arrows-rotate">
+    The connector handles reconnections automatically, but implement error handlers for critical issues.
+  </Card>
+</CardGroup>
+
+## Fee Structure
+
+Binance Futures market maker rebate program:
+
+| Tier | Maker Fee | Taker Fee |
+|------|-----------|------------|
+| VIP 0 | 0.0200% | 0.0500% |
+| VIP 1 | 0.0160% | 0.0400% |
+| **MM Program** | **-0.0050%** | **0.0700%** |
+
+<Tip>
+  Use `.trading_value_fee_model(-0.00005, 0.0007)` in your backtest to match the market maker rebate program fees.
+</Tip>
+
+## Resources
+
+- [Binance Futures API Documentation](https://binance-docs.github.io/apidocs/futures/en/)
+- [Market Maker Program](https://www.binance.com/en/support/announcement/binance-upgrades-usd%E2%93%A2-margined-futures-liquidity-provider-program-2023-04-04-01007356e6514df3811b0c80ab8c83bf)
+- [Example: Grid Trading Strategy](https://github.com/nkaz001/hftbacktest/blob/master/hftbacktest/examples/gridtrading_live.rs)
