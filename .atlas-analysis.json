@@ -1,0 +1,133 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "HftBacktest",
+  "projectDescription": "High-frequency trading and market-making backtesting tool with support for limit orders, queue positions, and latency modeling using full tick data.",
+  "theme": "sequoia",
+  "primaryColor": "#2563eb",
+  "lightColor": "#3b82f6",
+  "darkColor": "#1e40af",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/backtesting",
+              "concepts/order-book",
+              "concepts/latency",
+              "concepts/queue-position",
+              "concepts/multi-asset"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/data-preparation",
+              "guides/market-depth-trades",
+              "guides/custom-data",
+              "guides/market-making",
+              "guides/grid-trading",
+              "guides/multi-market",
+              "guides/live-trading"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/level3-backtesting",
+              "advanced/latency-modeling",
+              "advanced/queue-models",
+              "advanced/accelerated-backtesting",
+              "advanced/pricing-framework",
+              "advanced/data-fusion"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python API",
+            "pages": [
+              "api/python/overview",
+              "api/python/hftbacktest",
+              "api/python/types",
+              "api/python/data",
+              "api/python/stats"
+            ]
+          },
+          {
+            "group": "Rust API",
+            "pages": [
+              "api/rust/overview",
+              "api/rust/backtest",
+              "api/rust/depth",
+              "api/rust/live",
+              "api/rust/types"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Examples",
+        "groups": [
+          {
+            "group": "Trading Strategies",
+            "pages": [
+              "examples/getting-started",
+              "examples/grid-trading",
+              "examples/market-making-alpha",
+              "examples/glft-model",
+              "examples/queue-based-mm"
+            ]
+          },
+          {
+            "group": "Exchange Integration",
+            "pages": [
+              "examples/binance",
+              "examples/bybit",
+              "examples/multi-exchange"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Complete tick-by-tick backtesting with customizable time intervals",
+    "Full order book reconstruction from Level-2 and Level-3 market data",
+    "Accurate latency modeling for feed and order processing",
+    "Queue position-based order fill simulation",
+    "Multi-asset and multi-exchange strategy support",
+    "Live trading bot deployment with same algorithm code",
+    "Python API with Numba JIT acceleration",
+    "High-performance Rust implementation",
+    "Real-world crypto trading examples for Binance and Bybit"
+  ],
+  "publicApiSurface": [
+    "HftBacktest (Python class)",
+    "hftbacktest::backtest::BacktestAsset",
+    "hftbacktest::backtest::MultiAssetMultiExchangeBacktest",
+    "hftbacktest::live::LiveBot",
+    "hftbacktest::depth::MarketDepth",
+    "hftbacktest::types::Order",
+    "hftbacktest::types::Event",
+    "submit_buy_order",
+    "submit_sell_order",
+    "cancel",
+    "wait_order_response",
+    "elapse",
+    "clear_inactive_orders"
+  ]
+}
